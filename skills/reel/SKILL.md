@@ -98,6 +98,9 @@ Optional, needs Accessibility (`reel doctor` shows `accessibility`):
   they touch the mouse. Without `--now` it follows the recording's clock, waiting for a
   `--start-on` recording to start. In a scene, `"act": "act.json"` does record + act in one
   command, and the edit draws the recorded pointer (`"cursorFrom": "script"` to override).
+  Add `"actCountdown": 3` (hands-off banner) and `"actRetries": 2` so a bumped mouse redoes
+  the take instead of failing the scene. `abortCause` in act's JSON: `person`, `process`,
+  `displaced`, `esc`.
 
 Batches: put shared styling in `./reel.json` presets (`--preset promo`), or a whole
 take in a scene file and iterate with `reel run scene.json --edit-only --preview check.png`.

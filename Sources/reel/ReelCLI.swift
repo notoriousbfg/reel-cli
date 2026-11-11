@@ -42,7 +42,7 @@ struct Reel: AsyncParsableCommand {
             `locate`, `act` and `record --ax-snapshots` also need Accessibility.
             File formats (events sidecar, cursor scripts, presets, scenes): reel help formats
             """,
-        version: "0.5.0",
+        version: "0.5.1",
         subcommands: [Record.self, Shot.self, Stop.self, Mark.self, Windows.self, Edit.self, Run.self, Cursor.self,
                       Changes.self, Info.self, Frame.self, Sheet.self, Locate.self, Act.self, Doctor.self, Formats.self]
     )
@@ -586,6 +586,9 @@ struct Run: AsyncParsableCommand {
             repeat a flag; true sets a flag; false sets --no-… where one exists.
             "act": "act.json" (or inline) performs a script with real input during the
             recording (needs Accessibility); without a stop condition the take ends after it.
+            "actCountdown": 3 shows a hands-off banner (with a tick) before the take;
+            "actRetries": 2 redoes the take from prepare if act aborts because the pointer was
+            moved (after the mouse has been still for 2s). Esc never retries.
             The edit then draws the recorded pointer; "cursorFrom": "script" draws "cursorScript".
             Paths are relative to the scene file. Presets come from ~/.config/reel/presets.json,
             then reel.json in the working directory, then reel.json beside the scene file
@@ -608,7 +611,7 @@ struct Run: AsyncParsableCommand {
         guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ReelError.message("\(url.lastPathComponent) must be a JSON object with \"record\", \"shot\" and/or \"edit\"")
         }
-        let unknown = Set(json.keys).subtracting(["record", "shot", "edit", "cursorScript", "act", "cursorFrom", "prepare", "teardown", "name", "notes"])
+        let unknown = Set(json.keys).subtracting(["record", "shot", "edit", "cursorScript", "act", "actCountdown", "actRetries", "cursorFrom", "prepare", "teardown", "name", "notes"])
         if !unknown.isEmpty { throw ReelError.message("Unknown scene keys: \(unknown.sorted().joined(separator: ", "))") }
         if json["shot"] != nil && (json["record"] != nil || json["edit"] != nil) {
             throw ReelError.message("A scene makes a still (\"shot\") or a video (\"record\"/\"edit\"), not both")
@@ -639,6 +642,29 @@ struct Run: AsyncParsableCommand {
         }
         let prepare = try SceneVars.commands(json["prepare"], key: "prepare")
         let teardown = try SceneVars.commands(json["teardown"], key: "teardown")
+        let retries = json["act"] == nil ? 0 : ((json["actRetries"] as? NSNumber)?.intValue ?? 0)
+        guard retries >= 0 else { throw ReelError.message("\"actRetries\" is a count, 0 or more") }
+        let original = json, baseVars = vars
+        var attempt = 0
+        while true {
+            json = original; vars = baseVars
+            do {
+                try await attemptTake(&json, vars: &vars, prepare: prepare, teardown: teardown, cache: cache,
+                                      sceneDir: sceneDir, rawOut: rawOut, doTake: doTake, previewURL: previewURL)
+                return
+            } catch let a as ActAborted where a.cause != "esc" && attempt < retries {
+                attempt += 1
+                log("Act aborted: \(a.reason). Retrying the take (\(attempt) of \(retries)).")
+                await InputWatch.waitForStillness(2, log: log)
+            } catch let a as ActAborted {
+                log("Error: act aborted: \(a.reason)" + (attempt > 0 ? " (after \(attempt) retr\(attempt == 1 ? "y" : "ies"))" : ""))
+                throw ExitCode(2)
+            }
+        }
+    }
+
+    private func attemptTake(_ json: inout [String: Any], vars: inout SceneVars, prepare: [String], teardown: [String],
+                             cache: URL, sceneDir: URL, rawOut: String, doTake: Bool, previewURL: URL?) async throws {
         if doTake && !prepare.isEmpty {
             log("── prepare")
             do {
@@ -695,6 +721,10 @@ struct Run: AsyncParsableCommand {
         let rec = json["record"] as? [String: Any]
         let recOutput = rec?["output"] as? String ?? "recording.mov"
         if doTake, let rec {
+            if json["act"] != nil, let n = (json["actCountdown"] as? NSNumber)?.intValue, n > 0 {
+                try Accessibility.require("A scene \"act\"")
+                await HandsOffCountdown.run(seconds: n, log: log)
+            }
             log("── record")
             var cmd = try Record.parse(try SceneArgs.flags(rec, invertible: []))
             if let act = json["act"] {
@@ -781,12 +811,18 @@ extension Run {
         case .success(let r):
             try printJSON(r)
             if let e = recordError { throw e }
-            if r.aborted != nil { throw ExitCode(2) }
+            if let reason = r.aborted { throw ActAborted(reason: reason, cause: r.abortCause ?? "unknown") }
         case .failure(let e):
             if let r = recordError { throw r }
             throw ReelError.message("act: \(e.localizedDescription)")
         }
     }
+}
+
+/// Act gave up mid-take; `reel run` may retry (actRetries), else exits with code 2.
+struct ActAborted: Error, LocalizedError {
+    var reason: String, cause: String
+    var errorDescription: String? { "act aborted: \(reason)" }
 }
 
 final class SharedBool: @unchecked Sendable {
@@ -1065,6 +1101,7 @@ struct Formats: ParsableCommand {
            "cursorScript": "moves.json" | [steps…],
            "act": "act.json" | {"steps": […]},   // performed with real input while recording
            "cursorFrom": "script",                // with "act": draw cursorScript, not the recorded pointer
+           "actCountdown": 3, "actRetries": 2,    // with "act": hands-off banner; redo aborted takes
            "edit": {"trim": "1.2-22" | [1.2, 22], "input": "raw.mov", <reel edit flags>,
                     "cut": ["asked+1..answered-0.3"], "speed": ["a..b=6"], "patch": ["img.png@0,0"]},
            "teardown": ["shell command", …]}     // always runs, after quitAfter

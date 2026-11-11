@@ -22,6 +22,10 @@ public struct ActResult: Codable, Sendable {
     public var steps: Int
     public var completed: Int
     public var aborted: String?
+    /// Why it aborted: "person" (hardware mouse input), "process" (another app posted
+    /// input), "displaced" (the pointer moved without any input event, e.g. a warp),
+    /// "esc", or "unknown" (input couldn't be monitored).
+    public var abortCause: String?
     public var duration: Double
     public var markers: [RecordingEvents.Marker]
     public var window: RecordingEvents.Rect
@@ -29,7 +33,7 @@ public struct ActResult: Codable, Sendable {
 }
 
 public enum Actor {
-    struct Aborted: Error { var reason: String }
+    struct Aborted: Error { var reason: String; var cause: String }
 
     public static func perform(_ o: ActOptions, log: @escaping (String) -> Void) async throws -> ActResult {
         try Accessibility.require("reel act")
@@ -94,6 +98,10 @@ public enum Actor {
             return CursorScript.Resolver.anchor(ref, in: found[ref.index ?? 0].frame)
         })
 
+        // Watches real input so an abort can say who moved the pointer.
+        let watch = InputWatch()
+        defer { watch.stop() }
+
         // Input state, so an abort can release anything held.
         var pos = CGEvent(source: nil)?.location ?? screen((0.5, 0.5))
         var buttonDown = false
@@ -102,9 +110,22 @@ public enum Actor {
         let started = now()
 
         func checkUser() throws {
-            if CGEventSource.keyState(.combinedSessionState, key: 53) { throw Aborted(reason: "Esc pressed") }
+            if CGEventSource.keyState(.combinedSessionState, key: 53) { throw Aborted(reason: "Esc pressed", cause: "esc") }
             if let actual = CGEvent(source: nil)?.location, hypot(actual.x - pos.x, actual.y - pos.y) > o.tolerance {
-                throw Aborted(reason: String(format: "the mouse moved (%.0f,%.0f → %.0f,%.0f)", pos.x, pos.y, actual.x, actual.y))
+                let moved = String(format: "(%.0f,%.0f → %.0f,%.0f)", pos.x, pos.y, actual.x, actual.y)
+                // Give the tap a moment to deliver the event that moved it.
+                Thread.sleep(forTimeInterval: 0.03)
+                switch watch.recentForeignInput(within: 1.0) {
+                case .person:
+                    throw Aborted(reason: "a person moved the mouse (hardware input) \(moved)", cause: "person")
+                case .process(let pid):
+                    let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
+                    throw Aborted(reason: "another process (\(name)) moved the pointer \(moved)", cause: "process")
+                case .none where watch.active:
+                    throw Aborted(reason: "the pointer wasn't where act left it \(moved), and no input event moved it (the app or macOS repositioned it)", cause: "displaced")
+                case .none:
+                    throw Aborted(reason: "the pointer moved \(moved); couldn't tell by whom (no Input Monitoring access)", cause: "unknown")
+                }
             }
         }
         func wait(until t: Double) async throws {
@@ -233,6 +254,7 @@ public enum Actor {
         }
 
         var aborted: String?
+        var abortCause: String?
         do {
             if !setupSteps.isEmpty { try await run(setupSteps, prefix: "setup step") }
             if o.script.setup != nil, let st = state, !o.now {
@@ -277,10 +299,12 @@ public enum Actor {
             try await run(steps, prefix: "step")
         } catch let a as Aborted {
             aborted = a.reason
+            abortCause = a.cause
         }
         if buttonDown { CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: pos, mouseButton: .left)?.post(tap: .cghidEventTap) }
         if let aborted { log("Aborted: \(aborted). Released the mouse.") }
-        return ActResult(steps: setupSteps.count + steps.count, completed: completed, aborted: aborted, duration: now() - started,
+        return ActResult(steps: setupSteps.count + steps.count, completed: completed, aborted: aborted, abortCause: abortCause,
+                         duration: now() - started,
                          markers: marks, window: .init(x: wf.minX, y: wf.minY, width: wf.width, height: wf.height), pid: window.pid)
     }
 }
@@ -321,5 +345,114 @@ public enum Keys {
         }
         guard let code = codes[keyName] else { throw ReelError.message("Unknown key \"\(keyName)\" in \"\(combo)\"") }
         return (code, flags)
+    }
+}
+
+/// A listen-only event tap that remembers the latest mouse/keyboard event not posted by
+/// this process. Hardware events carry source pid 0; posted ones carry their poster's pid.
+public final class InputWatch: @unchecked Sendable {
+    enum Source { case person, process(Int32) }
+    private let lock = NSLock()
+    private var last: (time: Double, source: Source)?
+    private var runLoop: CFRunLoop?
+    private(set) var active = false
+
+    init() {
+        let ready = DispatchSemaphore(value: 0)
+        let thread = Thread { [self] in
+            let types: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .leftMouseDown, .rightMouseDown, .keyDown, .scrollWheel]
+            let mask = types.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
+            let me = Unmanaged.passUnretained(self).toOpaque()
+            let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+                                        eventsOfInterest: mask, callback: { _, type, event, info in
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput { return Unmanaged.passUnretained(event) }
+                let watch = Unmanaged<InputWatch>.fromOpaque(info!).takeUnretainedValue()
+                let pid = Int32(event.getIntegerValueField(.eventSourceUnixProcessID))
+                if pid != getpid() { watch.record(pid == 0 ? .person : .process(pid)) }
+                return Unmanaged.passUnretained(event)
+            }, userInfo: me)
+            if let tap {
+                let src = CFMachPortCreateRunLoopSource(nil, tap, 0)
+                CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+                CGEvent.tapEnable(tap: tap, enable: true)
+                self.runLoop = CFRunLoopGetCurrent()
+                self.active = true
+            }
+            ready.signal()
+            if tap != nil { CFRunLoopRun() }
+        }
+        thread.name = "reel.input-watch"
+        thread.start()
+        ready.wait()
+    }
+
+    private func record(_ s: Source) {
+        lock.withLock { last = (Date().timeIntervalSince1970, s) }
+    }
+
+    func recentForeignInput(within seconds: Double) -> Source? {
+        lock.withLock {
+            guard let last, Date().timeIntervalSince1970 - last.time <= seconds else { return nil }
+            return last.source
+        }
+    }
+
+    func stop() { if let runLoop { CFRunLoopStop(runLoop) } }
+
+    /// Waits until there has been no hardware or posted input for `seconds`.
+    public static func waitForStillness(_ seconds: Double, log: (String) -> Void) async {
+        let any = CGEventType(rawValue: ~0)!
+        var told = false
+        while CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: any) < seconds {
+            if !told { log(String(format: "Waiting for the mouse and keyboard to be still for %.0fs…", seconds)); told = true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+}
+
+/// A small on-screen banner with a ticking sound, so whoever is at the Mac knows to let go
+/// before reel takes over the pointer. The banner is kept out of screen captures.
+public enum HandsOffCountdown {
+    public static func run(seconds: Int, log: (String) -> Void) async {
+        guard seconds > 0 else { return }
+        await AppKitSession.ensure()
+        let panel = await MainActor.run { () -> (NSPanel, NSTextField) in
+            NSApp.setActivationPolicy(.accessory)
+            let w: CGFloat = 460, h: CGFloat = 54
+            let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let p = NSPanel(contentRect: NSRect(x: screen.midX - w / 2, y: screen.maxY - h - 24, width: w, height: h),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            p.level = .screenSaver
+            p.isOpaque = false
+            p.backgroundColor = .clear
+            p.ignoresMouseEvents = true
+            p.sharingType = .none
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+            bg.material = .hudWindow; bg.state = .active; bg.blendingMode = .behindWindow
+            bg.wantsLayer = true; bg.layer?.cornerRadius = 14; bg.layer?.masksToBounds = true
+            let label = NSTextField(labelWithString: "")
+            label.font = .systemFont(ofSize: 17, weight: .semibold)
+            label.alignment = .center
+            label.frame = NSRect(x: 12, y: (h - 24) / 2, width: w - 24, height: 24)
+            bg.addSubview(label)
+            p.contentView = bg
+            p.orderFrontRegardless()
+            return (p, label)
+        }
+        for n in stride(from: seconds, to: 0, by: -1) {
+            let text = "Hands off the mouse — reel takes over in \(n)…"
+            log(text)
+            await MainActor.run {
+                panel.1.stringValue = text
+                panel.0.displayIfNeeded()
+                NSSound(named: "Tink")?.play()
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+        await MainActor.run {
+            NSSound(named: "Pop")?.play()
+            panel.0.orderOut(nil)
+        }
     }
 }

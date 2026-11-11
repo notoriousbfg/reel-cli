@@ -99,6 +99,11 @@ camera. Without `"setup"`, act follows the recording's clock and waits for a
 print `KEY=VALUE` lines used later as `${KEY}`. A scene's `"act"` performs a script
 with real input during its recording (one command for a take with real hover and
 drag states); its edit then draws the recorded pointer, so drawn and real can't drift.
+`"actCountdown": 3` shows a hands-off banner (kept out of recordings) with a tick
+before the take, and `"actRetries": 2` redoes the take from prepare when act aborts,
+once the mouse has been still for 2 s. Act's abort message and `abortCause` say who
+moved the pointer: `person` (hardware input), `process` (another app posted input) or
+`displaced` (it moved without any input event).
 
 `reel help formats` documents every JSON file: the events sidecar, cursor
 scripts, presets and scene files.
