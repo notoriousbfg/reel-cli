@@ -42,7 +42,7 @@ struct Reel: AsyncParsableCommand {
             `locate`, `act` and `record --ax-snapshots` also need Accessibility.
             File formats (events sidecar, cursor scripts, presets, scenes): reel help formats
             """,
-        version: "0.4.0",
+        version: "0.4.1",
         subcommands: [Record.self, Shot.self, Stop.self, Mark.self, Windows.self, Edit.self, Run.self, Cursor.self,
                       Changes.self, Info.self, Frame.self, Sheet.self, Locate.self, Act.self, Doctor.self, Formats.self]
     )
@@ -154,8 +154,10 @@ struct TargetOptions: ParsableArguments {
     var display = false
     @Option(help: "Seconds to wait for the app window to appear.")
     var windowTimeout: Double = 15
-    @Flag(help: "Quit the app when done.")
+    @Flag(help: "Quit the app when done (reported only once its process has exited).")
     var quitAfter = false
+    @Flag(help: "Like --quit-after, but force-quit the app if it hasn't gone 5s later (e.g. a save sheet is open).")
+    var forceQuit = false
     @Option(help: "Launch, then start capturing only when this marker arrives (`reel mark`, --marks-file, or `reel act` setup); t=0 is that moment.")
     var startOn: String?
     @Option(help: "Seconds to wait for each marker (--start-on, --stop-on) before failing the take.")
@@ -166,7 +168,7 @@ struct TargetOptions: ParsableArguments {
     func options(output: URL) throws -> RecordOptions {
         var o = RecordOptions(output: output)
         o.app = app; o.pid = pid; o.launch = launch; o.newInstance = newInstance
-        o.background = background; o.openURL = openURL; o.quitAfter = quitAfter
+        o.background = background; o.openURL = openURL; o.quitAfter = quitAfter || forceQuit; o.forceQuit = forceQuit
         o.marksFile = marksFile.map(absURL)
         o.startOn = startOn; o.markerTimeout = timeout
         for e in env {
@@ -621,6 +623,14 @@ struct Run: AsyncParsableCommand {
         vars.values["OUT_DIR"] = out.deletingLastPathComponent().path
 
         let doTake = !editOnly
+        // prepare's values from the last full run, so --edit-only can resolve them.
+        let cache = sceneDir.appendingPathComponent(".\(url.deletingPathExtension().lastPathComponent).vars.json")
+        if !doTake {
+            if let data = try? Data(contentsOf: cache), let saved = try? JSONDecoder().decode([String: String].self, from: data) {
+                for (k, v) in saved where vars.values[k] == nil { vars.values[k] = v }
+            }
+            vars.hint = "With --edit-only, prepare doesn't run: its values come from the last full run (\(cache.lastPathComponent)). Run the full take once."
+        }
         let prepare = try SceneVars.commands(json["prepare"], key: "prepare")
         let teardown = try SceneVars.commands(json["teardown"], key: "teardown")
         if doTake && !prepare.isEmpty {
@@ -630,6 +640,7 @@ struct Run: AsyncParsableCommand {
                     let exported = try vars.run(cmd, dir: sceneDir, label: "prepare[\(i)]", exportValues: true)
                     if !exported.isEmpty { log("   exported \(exported.joined(separator: ", "))") }
                 }
+                if let data = try? JSONEncoder().encode(vars.values) { try? data.write(to: cache) }
             } catch {
                 runTeardown(teardown, vars: vars, dir: sceneDir)
                 throw error
@@ -640,8 +651,14 @@ struct Run: AsyncParsableCommand {
             let finalOut = absURL(try vars.expand(rawOut))
             vars.values["OUT"] = finalOut.path
             vars.values["OUT_DIR"] = finalOut.deletingLastPathComponent().path
-            for key in ["record", "shot", "edit", "cursorScript"] where json[key] != nil {
+            // An edit-only run needs the edit, the cursor script and the recording's
+            // name, not the record block's launch settings.
+            for key in (doTake ? ["record", "shot", "edit", "cursorScript"] : ["edit", "cursorScript"]) where json[key] != nil {
                 json[key] = try vars.expandAny(json[key]!)
+            }
+            if !doTake, var rec = json["record"] as? [String: Any], let o = rec["output"] {
+                rec["output"] = try vars.expandAny(o)
+                json["record"] = rec
             }
             try await take(json, doTake: doTake, previewURL: previewURL)
         } catch {
@@ -712,6 +729,7 @@ struct Run: AsyncParsableCommand {
 /// ${NAME} values for scene files: built-ins plus KEY=VALUE lines from prepare commands.
 struct SceneVars {
     var values: [String: String]
+    var hint: String?
     init(builtins: [String: String]) { values = builtins }
 
     static func commands(_ v: Any?, key: String) throws -> [String] {
@@ -731,7 +749,7 @@ struct SceneVars {
             if let v = values[name] ?? ProcessInfo.processInfo.environment[name] { out += v }
             else if strict {
                 throw ReelError.message("Unknown ${\(name)} in the scene. Built-ins: SCENE_DIR, SCENE_NAME, OUT, OUT_DIR; "
-                                        + "prepare commands can define more by printing \(name)=value")
+                                        + "prepare commands can define more by printing \(name)=value" + (hint.map { ". " + $0 } ?? ""))
             } else { out += "${\(name)}" }
             rest = rest[rest.index(after: close)...]
         }
@@ -976,7 +994,9 @@ struct Formats: ParsableCommand {
           shown. Built-ins: ${SCENE_DIR}, ${SCENE_NAME} (file name without .json), ${OUT}
           (the final output: edit, shot or record "output"), ${OUT_DIR}. Unknown names fall
           back to the environment, else the scene fails (teardown still runs).
-          `reel run scene.json --edit-only` redoes the edit (no prepare/teardown);
+          `reel run scene.json --edit-only` redoes the edit (no prepare/teardown); it expands
+          only the edit, cursor script and record "output", using prepare's values saved by
+          the last full run in .<scene>.vars.json beside the scene;
           `--preview check.png` renders a contact sheet instead of exporting.
 
         MARKER TIMING  (record/shot --start-on)

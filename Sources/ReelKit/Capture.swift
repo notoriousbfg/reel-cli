@@ -28,8 +28,13 @@ public struct ErrorInfo: Codable, Sendable, Equatable {
         underlying = chain.isEmpty ? nil : chain
     }
 
+    public init(domain: String, code: Int, description: String) {
+        self.domain = domain; self.code = code; self.description = description
+    }
+
     /// "Unknown stream error (SCStreamErrorDomain -3805; underlying …)"
     public var summary: String {
+        if domain == "reel" { return description }   // reel's own explanations
         var s = "\(description) (\(domain) \(code)"
         if let reason { s += "; \(reason)" }
         if let underlying { s += "; underlying: " + underlying.joined(separator: "; ") }

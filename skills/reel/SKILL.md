@@ -72,6 +72,10 @@ time by marker: `--cut asked+1..answered-0.3` or `--speed asked+1..answered-0.3=
 after it (markers, cursor, src: zooms) still line up. Reject takes whose record JSON shows
 too much `lostSeconds`.
 
+`quit` in the record JSON is true only once the app's process has exited; false means it is
+still running (a sheet is open): use `--force-quit`. If the app dies mid-take, `stoppedEarly`
+says "The app exited or crashed at Ns" and `endedBy` is `app-exit`.
+
 Markers from a sandboxed app: have it append `<label> <unix time>` lines to a file it can
 write, and pass `--marks-file <file>` to `reel record` (or `reel mark --import <file> --clip raw.mov`
 afterwards).

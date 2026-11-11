@@ -72,7 +72,7 @@ reel edit raw.mov:1.2-22 … -o promo.mp4
 
 # Or describe the whole take once and re-run it
 reel run scene.json                      # prepare → record (or shot) → edit → teardown
-reel run scene.json --edit-only --preview check.png
+reel run scene.json --edit-only --preview check.png   # reuses prepare's saved values
 ```
 
 If macOS stops the capture stream mid-take, `record` restarts it (up to

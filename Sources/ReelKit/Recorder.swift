@@ -30,7 +30,8 @@ public struct RecordOptions: Sendable {
     public var stopOn: String?         // stop when this marker arrives (+ tail)
     public var tail: Double = 0        // seconds to keep recording after the stop marker
     public var markerTimeout: Double?  // bound on each marker wait; fails the take
-    public var cleanTitlebar = false   // store a still of the traffic-light corner to patch over the capture pill
+    public var cleanTitlebar = false
+    public var forceQuit = false       // if the app won't quit (a sheet is open), force it   // store a still of the traffic-light corner to patch over the capture pill
     public var openURL: String?        // URL/file to open in the app (e.g. localhost for web devs)
     public var windowTitle: String?    // substring match on window title
     public var windowID: UInt32?
@@ -71,8 +72,10 @@ public struct RecordResult: Codable, Sendable {
     public var lostSeconds: Double = 0
     /// Seconds with no new frames while capture restarted (held frame in the video).
     public var gaps: [[Double]]?
-    /// Set when --quit-after asked the app to quit.
+    /// Set when --quit-after asked the app to quit: true only once the process has exited.
     public var quit: Bool?
+    /// True when the app had to be force-quit (--force-quit).
+    public var forcedQuit: Bool?
     /// What ended the take: duration, stop-marker, stop (Ctrl-C / reel stop), app-exit,
     /// stream-error or timeout.
     public var endedBy: String?
@@ -98,6 +101,7 @@ public struct ShotResult: Codable, Sendable {
     public var windowTitle: String?
     public var markers: [RecordingEvents.Marker]?
     public var quit: Bool?
+    public var forcedQuit: Bool?
 }
 
 public struct WindowInfo: Codable, Sendable {
@@ -146,6 +150,7 @@ public final class Recorder: @unchecked Sendable {
     public init(options: RecordOptions) { self.opts = options }
 
     public func run(log: @escaping (String) -> Void) async throws -> RecordResult {
+        self.log = log
         try Permissions.requireScreenRecording()
         // A bare CLI has no window-server (CGS) connection; SCShareableContent.info(for:),
         // SCStream and CGEvent assert without one. NSApplication.shared establishes it.
@@ -164,7 +169,7 @@ public final class Recorder: @unchecked Sendable {
         }
         try FileManager.default.createDirectory(at: opts.output.deletingLastPathComponent(), withIntermediateDirectories: true)
         let (target, targetPID, _) = try await prepareTarget(log: log)
-        let signals = StopSignals(exitOf: opts.untilExit ? targetPID : nil)
+        let signals = StopSignals(exitOf: targetPID)
         defer { signals.cancel() }
         var (state, marksWatcher) = try arm(target: target, pid: targetPID, log: log)
         defer { RecordingState.remove() }
@@ -173,6 +178,9 @@ public final class Recorder: @unchecked Sendable {
         if let label = opts.startOn {
             do { try await waitForStart(label, state: state, pid: targetPID, signals: signals, log: log) }
             catch { _ = await quitIfAsked(targetPID, log: log); throw error }
+            if let pid = targetPID, !Self.alive(pid) {
+                throw ReelError.message("The app exited before capture started")
+            }
             if let fresh = await freshFilter(target) { filter = fresh }   // it may have moved during setup
         }
         let info = SCShareableContent.info(for: filter)
@@ -283,7 +291,11 @@ public final class Recorder: @unchecked Sendable {
                 await current.simulateStop()
             }
             if signals.requested { endedBy = "stop"; break }
-            if signals.appExited { endedBy = "app-exit"; break }
+            if signals.appExited {
+                endedBy = "app-exit"
+                if !opts.untilExit { endedEarly = appGone(signals, t0: t0) }
+                break
+            }
             if let d = opts.duration, elapsed >= d { endedBy = "duration"; break }
             if let label = opts.stopOn {
                 tick += 1
@@ -307,13 +319,27 @@ public final class Recorder: @unchecked Sendable {
                 _ = await current.waitFinished(timeout: 5)     // keep what it wrote
                 let remaining = opts.duration.map { $0 - (CACurrentMediaTime() - t0) } ?? .infinity
                 let windowAlive = await Self.windowExists(target.windowID)
+                if !windowAlive, let pid = targetPID {
+                    // The window vanished: usually the app quit or crashed (a crash report can
+                    // keep the process alive briefly), so wait a moment for it to go.
+                    let deadline = Date().addingTimeInterval(3)
+                    while Self.alive(pid) && !signals.appExited && Date() < deadline { try? await Task.sleep(for: .milliseconds(50)) }
+                    if !Self.alive(pid) || signals.appExited {
+                        endedBy = "app-exit"
+                        if !opts.untilExit { endedEarly = appGone(signals, t0: t0, fallback: elapsed) }
+                        break
+                    }
+                }
                 if signals.appExited || signals.requested || remaining < 0.5 {
-                    endedBy = signals.appExited ? "app-exit" : signals.requested ? "stop" : "duration"; break
+                    endedBy = signals.appExited ? "app-exit" : signals.requested ? "stop" : "stream-error"
+                    if signals.appExited && !opts.untilExit { endedEarly = appGone(signals, t0: t0, fallback: elapsed) }
+                    break
                 }
                 guard restarts < opts.maxRestarts, windowAlive else {
-                    endedEarly = info
-                    endedBy = "stream-error"
-                    log(windowAlive ? "Giving up after \(restarts) restarts" : "The window is gone; ending the recording")
+                    endedEarly = windowAlive ? info
+                        : ErrorInfo(domain: "reel", code: 2, description: String(format: "The window closed at %.2fs (the app is still running)", elapsed))
+                    endedBy = windowAlive ? "stream-error" : "window-closed"
+                    log(windowAlive ? "Giving up after \(restarts) restarts" : endedEarly!.description)
                     break
                 }
                 do {
@@ -327,9 +353,14 @@ public final class Recorder: @unchecked Sendable {
                     gaps.append([(gapStart * 1000).rounded() / 1000, (offset * 1000).rounded() / 1000])
                     log(String(format: "Capture restarted at %.2fs (restart %d of %d)", offset, restarts, opts.maxRestarts))
                 } catch {
-                    endedEarly = ErrorInfo(error)
-                    endedBy = "stream-error"
-                    log("Could not restart capture: \(endedEarly!.summary)")
+                    if let pid = targetPID, !Self.alive(pid) || signals.appExited {
+                        endedBy = "app-exit"
+                        if !opts.untilExit { endedEarly = appGone(signals, t0: t0, fallback: elapsed) }
+                    } else {
+                        endedEarly = ErrorInfo(error)
+                        endedBy = "stream-error"
+                        log("Could not restart capture: \(endedEarly!.summary)")
+                    }
                     break
                 }
                 continue
@@ -351,7 +382,7 @@ public final class Recorder: @unchecked Sendable {
         }
 
         // --quit-after applies however the recording ended.
-        let quit = await quitIfAsked(targetPID, log: log)
+        let (quit, forced) = await quitIfAsked(targetPID, log: log)
 
         // Finalise: one segment is renamed into place; several are joined on the t=0 timeline.
         let written = parts.filter { FileManager.default.fileExists(atPath: $0.segment.url.path) }
@@ -392,7 +423,7 @@ public final class Recorder: @unchecked Sendable {
                             windowID: target.windowID, markers: markers.isEmpty ? nil : markers,
                             stoppedEarly: endedEarly?.summary, stopError: lastError,
                             restarts: restarts, lostSeconds: (gaps.reduce(0) { $0 + $1[1] - $1[0] } * 1000).rounded() / 1000,
-                            gaps: gaps.isEmpty ? nil : gaps, quit: quit,
+                            gaps: gaps.isEmpty ? nil : gaps, quit: quit, forcedQuit: forced,
                             endedBy: endedBy, timedOut: timedOut)
     }
 
@@ -458,19 +489,41 @@ public final class Recorder: @unchecked Sendable {
         return SCContentFilter(desktopIndependentWindow: w)
     }
 
-    /// --quit-after: asks the app to quit and waits (up to 5s) for it to go.
-    private func quitIfAsked(_ pid: Int32?, force: Bool = false, log: (String) -> Void) async -> Bool? {
-        guard opts.quitAfter || force, let pid, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return nil }
-        let name = app.localizedName ?? "the app"
-        var ok = app.terminate()
-        if ok {
-            // terminate() only asks; wait for the process to go so the result is true to its word.
-            let deadline = Date().addingTimeInterval(5)
-            while !app.isTerminated && kill(pid, 0) == 0 && Date() < deadline { try? await Task.sleep(for: .milliseconds(100)) }
-            ok = app.isTerminated || kill(pid, 0) != 0
+    /// Whether a process still exists (EPERM means it exists but isn't ours).
+    static func alive(_ pid: Int32) -> Bool { kill(pid, 0) == 0 || errno == EPERM }
+
+    /// "The app exited or crashed at 2.00s", timed from the process-exit event.
+    private func appGone(_ signals: StopSignals, t0: CFTimeInterval, fallback: Double? = nil) -> ErrorInfo {
+        let at = signals.exitedAt.map { max(0, $0 - t0) } ?? fallback ?? (CACurrentMediaTime() - t0)
+        let info = ErrorInfo(domain: "reel", code: 1, description: String(format: "The app exited or crashed at %.2fs", at))
+        log?(info.description)
+        return info
+    }
+    private var log: ((String) -> Void)?
+
+    /// --quit-after / --force-quit: asks the app to quit, and reports success only once
+    /// the process has really exited. Returns (quit, forced).
+    private func quitIfAsked(_ pid: Int32?, force: Bool = false, log: (String) -> Void) async -> (Bool?, Bool?) {
+        guard opts.quitAfter || opts.forceQuit || force, let pid, Self.alive(pid) else { return (nil, nil) }
+        let app = NSRunningApplication(processIdentifier: pid)
+        let name = app?.localizedName ?? "pid \(pid)"
+        func waitGone(_ seconds: Double) async -> Bool {
+            let deadline = Date().addingTimeInterval(seconds)
+            while Self.alive(pid) && Date() < deadline { try? await Task.sleep(for: .milliseconds(100)) }
+            return !Self.alive(pid)
         }
-        log(ok ? "Quit \(name)" : "\(name) did not quit (it may be showing a dialog)")
-        return ok
+        _ = app?.terminate()
+        if await waitGone(5) { log("Quit \(name)"); return (true, nil) }
+        guard opts.forceQuit else {
+            log("warning: \(name) is still running (pid \(pid)) 5s after being asked to quit; a sheet or dialog is probably open. Use --force-quit to force it.")
+            return (false, nil)
+        }
+        _ = app?.forceTerminate()
+        if !(await waitGone(2)) { kill(pid, SIGKILL); _ = await waitGone(2) }
+        let gone = !Self.alive(pid)
+        log(gone ? "\(name) didn't quit (a sheet or dialog was probably open); force-quit it"
+                 : "warning: could not force-quit \(name) (pid \(pid))")
+        return (gone, true)
     }
 
     // MARK: - Still image (reel shot)
@@ -483,7 +536,7 @@ public final class Recorder: @unchecked Sendable {
         var (state, watcher) = try arm(target: target, pid: targetPID, log: log)
         defer { RecordingState.remove() }
         defer { watcher?.stop() }
-        let quitAtEnd = !s.keepOpen && (opts.quitAfter || launchedNew)
+        let quitAtEnd = !s.keepOpen && (opts.quitAfter || opts.forceQuit || launchedNew)
         do {
             if let label = opts.startOn {
                 try await waitForStart(label, state: state, pid: targetPID, signals: signals, log: log)
@@ -507,12 +560,12 @@ public final class Recorder: @unchecked Sendable {
             log("Saved \(target.label) → \(opts.output.path)")
             let markers = state.collectMarks()
             watcher?.stop(); watcher = nil
-            let quit = quitAtEnd ? await quitIfAsked(targetPID, force: true, log: log) : nil
+            let (quit, forced) = quitAtEnd ? await quitIfAsked(targetPID, force: true, log: log) : (nil, nil)
             return ShotResult(output: opts.output.path,
                               width: written[kCGImagePropertyPixelWidth] as? Int ?? image.width,
                               height: written[kCGImagePropertyPixelHeight] as? Int ?? image.height,
                               pid: targetPID, windowID: target.windowID, windowTitle: target.title,
-                              markers: markers.isEmpty ? nil : markers, quit: quit)
+                              markers: markers.isEmpty ? nil : markers, quit: quit, forcedQuit: forced)
         } catch {
             if quitAtEnd { _ = await quitIfAsked(targetPID, force: true, log: log) }
             throw error
@@ -712,9 +765,12 @@ public final class Recorder: @unchecked Sendable {
 final class StopSignals: @unchecked Sendable {
     private let lock = NSLock()
     private var _requested = false, _appExited = false
+    private var _exitedAt: CFTimeInterval?
     private var sources: [DispatchSourceProtocol] = []
     var requested: Bool { lock.withLock { _requested } }
     var appExited: Bool { lock.withLock { _appExited } }
+    /// CACurrentMediaTime() when the app's process exited.
+    var exitedAt: CFTimeInterval? { lock.withLock { _exitedAt } }
 
     init(exitOf pid: Int32?) {
         for sig in [SIGINT, SIGTERM] {
@@ -726,10 +782,13 @@ final class StopSignals: @unchecked Sendable {
         }
         if let pid {
             let p = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .global())
-            p.setEventHandler { [weak self] in self?.lock.withLock { self?._appExited = true } }
+            p.setEventHandler { [weak self] in
+                let now = CACurrentMediaTime()
+                self?.lock.withLock { self?._appExited = true; self?._exitedAt = now }
+            }
             p.resume()
             sources.append(p)
-            if kill(pid, 0) != 0 { _appExited = true }
+            if !Recorder.alive(pid) { _appExited = true; _exitedAt = CACurrentMediaTime() }
         }
     }
 
