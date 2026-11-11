@@ -1,0 +1,300 @@
+import CoreImage
+import Foundation
+
+/// Turns an `EditPlan` into a frame for any output time. This is the single
+/// rendering path: export, previews and contact sheets of edits all use it.
+public final class Composer: @unchecked Sendable {
+    public let plan: EditPlan
+    let events: [RecordingEvents?]
+    let W: Double, H: Double
+    let background: CIImage
+    let placed: [CGRect]     // where each clip's content lands on the canvas (CI coords)
+    let keyframes: [Keyframe]
+    /// Per clip: drawn cursor sprite at that clip's output scale, and its clicks.
+    let cursorSprites: [CursorSprite?]
+    let clipClicks: [[RecordingEvents.Click]]
+
+    public init(plan: EditPlan) throws {
+        self.plan = plan
+        W = Double(plan.canvas.width)
+        H = Double(plan.canvas.height)
+        events = try plan.clips.map { try $0.loadEvents() }
+
+        let canvas = CGRect(x: 0, y: 0, width: W, height: H)
+        let colors = try plan.canvas.background.map { CIColor(cgColor: try Parse.color($0)) }
+        if colors.count >= 2 {
+            background = CIFilter(name: "CILinearGradient", parameters: [
+                "inputPoint0": CIVector(x: 0, y: H), "inputColor0": colors[0],
+                "inputPoint1": CIVector(x: W * 0.35, y: 0), "inputColor1": colors[1],
+            ])!.outputImage!.cropped(to: canvas)
+        } else {
+            background = CIImage(color: colors.first ?? .black).cropped(to: canvas)
+        }
+
+        let pad = plan.canvas.padding
+        let area = canvas.insetBy(dx: pad, dy: pad)
+        placed = plan.clips.map { c in
+            let s = min(area.width / c.crop.width, area.height / c.crop.height)
+            let w = c.crop.width * s, h = c.crop.height * s
+            return CGRect(x: area.midX - w / 2, y: area.midY - h / 2, width: w, height: h)
+        }
+        keyframes = Self.buildKeyframes(plan.zooms, ease: plan.zoomEase)
+
+        let placedRects = placed
+        let evs = events
+        cursorSprites = plan.clips.indices.map { i in
+            guard let style = plan.cursor, let ev = evs[i] else { return nil }
+            // Output pixels per screen point for this clip.
+            let k = ev.pointPixelScale * placedRects[i].width / plan.clips[i].crop.width
+            return CursorSprite(pixelsPerPoint: k * style.scale)
+        }
+        clipClicks = events.map { $0?.clicks ?? [] }
+    }
+
+    // MARK: Coordinate mapping
+
+    /// Maps a point normalized to clip `i`'s *source* frame (top-left origin)
+    /// into normalized output-frame coordinates (top-left origin).
+    public func outputPoint(clip i: Int, sourceX: Double, sourceY: Double) -> (x: Double, y: Double) {
+        let c = plan.clips[i]
+        let u = (sourceX * c.sourceWidth - c.crop.x) / c.crop.width
+        let v = (sourceY * c.sourceHeight - c.crop.y) / c.crop.height
+        let r = placed[i]
+        let topY = H - r.maxY
+        return ((r.minX + u * r.width) / W, (topY + v * r.height) / H)
+    }
+
+    /// Recorded clicks for every clip, mapped onto the output timeline/frame.
+    public func outputClicks() -> [(t: Double, x: Double, y: Double)] {
+        let starts = plan.clipStarts
+        var out: [(Double, Double, Double)] = []
+        for (i, ev) in events.enumerated() {
+            guard let ev else { continue }
+            let c = plan.clips[i]
+            for k in ev.clicks where k.t >= c.trimStart && k.t <= c.trimEnd {
+                let p = outputPoint(clip: i, sourceX: k.x, sourceY: k.y)
+                out.append((starts[i] + (k.t - c.trimStart) / c.speed, p.x, p.y))
+            }
+        }
+        return out
+    }
+
+    func cursor(at t: Double) -> (x: Double, y: Double)? {
+        guard let i = plan.activeClips(at: min(t, plan.totalDuration - 1e-3)).last, let ev = events[i],
+              let p = ev.smoothedCursor(at: plan.sourceTime(clip: i, at: t)) else { return nil }
+        return outputPoint(clip: i, sourceX: p.x, sourceY: p.y)
+    }
+
+    // MARK: Zoom keyframes
+
+    struct Keyframe {
+        var t: Double
+        var scale: Double
+        var target: EditPlan.ZoomTarget
+    }
+
+    /// Each zoom eases in, holds, and eases out. Zooms that touch or overlap
+    /// become a pan from one target to the next instead of zooming out between.
+    static func buildKeyframes(_ zooms: [EditPlan.Zoom], ease: Double) -> [Keyframe] {
+        let sorted = zooms.sorted { $0.start < $1.start }
+        var kfs: [Keyframe] = []
+        for (i, z) in sorted.enumerated() {
+            let e = min(ease, (z.end - z.start) / 2)
+            let joinsPrev = i > 0 && z.start <= sorted[i - 1].end
+            let joinsNext = i + 1 < sorted.count && sorted[i + 1].start <= z.end
+            if !joinsPrev { kfs.append(.init(t: z.start, scale: 1, target: z.target)) }
+            kfs.append(.init(t: joinsPrev ? max(z.start + e, kfs.last!.t + 0.01) : z.start + e, scale: z.scale, target: z.target))
+            kfs.append(.init(t: max(z.end - e, kfs.last!.t + 0.001), scale: z.scale, target: z.target))
+            if !joinsNext { kfs.append(.init(t: max(z.end, kfs.last!.t + 0.001), scale: 1, target: z.target)) }
+        }
+        return kfs
+    }
+
+    func resolve(_ target: EditPlan.ZoomTarget, at t: Double) -> (x: Double, y: Double) {
+        switch target {
+        case .point(let x, let y): return (x, y)
+        case .cursor: return cursor(at: t) ?? (0.5, 0.5)
+        }
+    }
+
+    /// Zoom scale and normalized target point at output time `t`.
+    public func zoomState(at t: Double) -> (scale: Double, x: Double, y: Double) {
+        let k = keyframes
+        guard let first = k.first, t >= first.t, let last = k.last, t <= last.t else { return (1, 0.5, 0.5) }
+        var i = 0
+        while i + 1 < k.count && k[i + 1].t <= t { i += 1 }
+        if i + 1 >= k.count {
+            let p = resolve(k[i].target, at: t)
+            return (k[i].scale, p.x, p.y)
+        }
+        let a = k[i], b = k[i + 1]
+        let u = smoothstep((t - a.t) / (b.t - a.t))
+        let pa = resolve(a.target, at: t), pb = resolve(b.target, at: t)
+        // Interpolate scale geometrically so zoom speed looks uniform.
+        let s = a.scale * pow(b.scale / a.scale, u)
+        return (s, pa.x + (pb.x - pa.x) * u, pa.y + (pb.y - pa.y) * u)
+    }
+
+    /// Where a normalized output point lands after the zoom at time `t`.
+    public func zoomedPoint(at t: Double, x: Double, y: Double) -> (x: Double, y: Double) {
+        let z = zoomState(at: t)
+        guard z.scale > 1.001 else { return (x, y) }
+        let vw = 1 / z.scale, vh = 1 / z.scale
+        let ox = min(max(z.x - vw / 2, 0), 1 - vw)
+        let oy = min(max(z.y - vh / 2, 0), 1 - vh)
+        return ((x - ox) * z.scale, (y - oy) * z.scale)
+    }
+
+    // MARK: Frame composition
+
+    /// Content for clip `i` placed on a transparent canvas.
+    func layer(clip i: Int, source: CIImage, at t: Double) -> CIImage {
+        let c = plan.clips[i]
+        let sh = source.extent.height
+        let cropCI = CGRect(x: c.crop.x, y: sh - c.crop.y - c.crop.height, width: c.crop.width, height: c.crop.height)
+        var img = source.cropped(to: cropCI)
+            .transformed(by: CGAffineTransform(translationX: -cropCI.minX, y: -cropCI.minY))
+        let r = placed[i]
+        let s = r.width / c.crop.width
+        if abs(s - 1) > 1e-3 {
+            img = s < 1
+                ? img.applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: s, kCIInputAspectRatioKey: 1])
+                : img.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        }
+        img = img.transformed(by: CGAffineTransform(translationX: r.minX - img.extent.minX, y: r.minY - img.extent.minY))
+            .cropped(to: r)
+
+        let radius = plan.canvas.cornerRadius
+        if radius > 0 {
+            let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
+                "inputExtent": CIVector(cgRect: r), "inputRadius": radius, "inputColor": CIColor.white,
+            ])!.outputImage!
+            img = img.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: CIImage.empty(), kCIInputMaskImageKey: mask,
+            ])
+        }
+        if plan.canvas.shadow {
+            let blur = max(12, min(r.width, r.height) * 0.03)
+            let shadow = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
+                "inputExtent": CIVector(cgRect: r), "inputRadius": radius,
+                "inputColor": CIColor(red: 0, green: 0, blue: 0, alpha: 0.55),
+            ])!.outputImage!
+                .applyingGaussianBlur(sigma: blur)
+                .transformed(by: CGAffineTransform(translationX: 0, y: -blur * 0.6))
+            img = img.composited(over: shadow)
+        }
+        return drawCursor(clip: i, at: t, over: img)
+    }
+
+    // MARK: Cursor overlay
+
+    static let clickEffectDuration = 0.45
+
+    /// Draws the recorded cursor (and click halos) for clip `i` over its layer.
+    /// Drawn before the zoom so it scales with the footage. Hidden while the
+    /// pointer is outside the cropped content.
+    func drawCursor(clip i: Int, at t: Double, over img: CIImage) -> CIImage {
+        guard let style = plan.cursor, let sprite = cursorSprites[i], let ev = events[i] else { return img }
+        let c = plan.clips[i], r = placed[i]
+        let st = plan.sourceTime(clip: i, at: t)
+        func place(_ x: Double, _ y: Double) -> CGPoint? {
+            let u = (x * c.sourceWidth - c.crop.x) / c.crop.width
+            let v = (y * c.sourceHeight - c.crop.y) / c.crop.height
+            guard (0...1).contains(u), (0...1).contains(v) else { return nil }
+            return CGPoint(x: r.minX + u * r.width, y: r.maxY - v * r.height)
+        }
+        var out = img
+        if style.clickEffect {
+            for k in clipClicks[i] where k.t <= st && st - k.t < Self.clickEffectDuration {
+                guard let p = place(k.x, k.y) else { continue }
+                out = sprite.halo(at: p, progress: (st - k.t) / Self.clickEffectDuration).composited(over: out)
+            }
+        }
+        // Light smoothing (±40ms) removes sampling jitter without visible lag.
+        guard let pos = ev.smoothedCursor(at: st, window: 0.04), let p = place(pos.x, pos.y) else { return out }
+        let pressed = ev.sample(at: st)?.down ?? false
+        return sprite.cursor(ev.shape(at: st), at: p, pressed: pressed).composited(over: out)
+    }
+
+    public func image(at t: Double, sources: [Int: CIImage]) -> CIImage {
+        let canvas = CGRect(x: 0, y: 0, width: W, height: H)
+        let active = plan.activeClips(at: t).filter { sources[$0] != nil }
+        var frame: CIImage
+
+        if active.count >= 2 {
+            let a = active[0], b = active[1]
+            let tr = plan.transitions[a]
+            let start = plan.clipStarts[b]
+            let p = smoothstep(tr.duration > 0 ? (t - start) / tr.duration : 1)
+            frame = transition(tr.kind, p: p,
+                               from: layer(clip: a, source: sources[a]!, at: t),
+                               to: layer(clip: b, source: sources[b]!, at: t))
+        } else if let i = active.first {
+            frame = layer(clip: i, source: sources[i]!, at: t).composited(over: background)
+        } else {
+            frame = background
+        }
+
+        let z = zoomState(at: t)
+        if z.scale > 1.001 {
+            let vw = W / z.scale, vh = H / z.scale
+            let cx = z.x * W, cy = (1 - z.y) * H
+            let ox = min(max(cx - vw / 2, 0), W - vw)
+            let oy = min(max(cy - vh / 2, 0), H - vh)
+            frame = frame.cropped(to: CGRect(x: ox, y: oy, width: vw, height: vh))
+                .transformed(by: CGAffineTransform(translationX: -ox, y: -oy).concatenating(.init(scaleX: z.scale, y: z.scale)))
+        }
+
+        var brightness = 1.0
+        if plan.fadeIn > 0 { brightness = min(brightness, t / plan.fadeIn) }
+        if plan.fadeOut > 0 { brightness = min(brightness, (plan.totalDuration - t) / plan.fadeOut) }
+        brightness = max(0, min(1, brightness))
+        if brightness < 0.999 {
+            frame = frame.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: brightness, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: brightness, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: brightness, w: 0),
+            ])
+        }
+        return frame.cropped(to: canvas)
+    }
+
+    private func transition(_ kind: EditPlan.TransitionKind, p: Double, from a: CIImage, to b: CIImage) -> CIImage {
+        let bg = background
+        func opacity(_ img: CIImage, _ alpha: Double) -> CIImage {
+            img.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: alpha)])
+        }
+        func moved(_ img: CIImage, _ dx: Double, _ dy: Double) -> CIImage {
+            img.transformed(by: CGAffineTransform(translationX: dx, y: dy))
+        }
+        switch kind {
+        case .cut:
+            return (p < 0.5 ? a : b).composited(over: bg)
+        case .crossfade:
+            return opacity(b, p).composited(over: a.composited(over: bg))
+        case .fade:
+            return p < 0.5 ? opacity(a, 1 - p * 2).composited(over: bg) : opacity(b, p * 2 - 1).composited(over: bg)
+        case .slideLeft:
+            return moved(b, (1 - p) * W, 0).composited(over: moved(a, -p * W, 0)).composited(over: bg)
+        case .slideRight:
+            return moved(b, -(1 - p) * W, 0).composited(over: moved(a, p * W, 0)).composited(over: bg)
+        case .slideUp:
+            return moved(b, 0, -(1 - p) * H).composited(over: moved(a, 0, p * H)).composited(over: bg)
+        case .slideDown:
+            return moved(b, 0, (1 - p) * H).composited(over: moved(a, 0, -p * H)).composited(over: bg)
+        case .wipe:
+            let revealed = b.composited(over: bg).cropped(to: CGRect(x: 0, y: 0, width: p * W, height: H))
+            return revealed.composited(over: a.composited(over: bg))
+        case .zoom:
+            let s = 1 + 0.15 * p
+            let grow = CGAffineTransform(translationX: -W / 2, y: -H / 2)
+                .concatenating(.init(scaleX: s, y: s)).concatenating(.init(translationX: W / 2, y: H / 2))
+            return opacity(b, p).composited(over: opacity(a.transformed(by: grow), 1 - p)).composited(over: bg)
+        }
+    }
+}
+
+@inline(__always) func smoothstep(_ x: Double) -> Double {
+    let c = min(max(x, 0), 1)
+    return c * c * (3 - 2 * c)
+}

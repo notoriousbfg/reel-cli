@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+*.mov
+*.mp4
+*.png
+!docs/**/*.png
