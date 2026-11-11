@@ -468,3 +468,30 @@ import CoreImage
         #expect(throws: (any Error).self) { try CursorScript.parse(Data(#"{"coordinates": "screen", "steps": []}"#.utf8), name: "t") }
     }
 }
+
+@Suite struct ZoomFocusTests {
+    /// A zoom towards a region near the frame's edge must grow about one fixed point
+    /// for the whole ease, not head for the corner and then slide.
+    @Test func edgeZoomKeepsOneFocalPoint() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("reel-focus-\(getpid())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let clip = dir.appendingPathComponent("still.mov")
+        try await SmoothZoomTests.sparseClip(clip, times: [0, 2, 4])
+        var o = EditOptions()
+        o.inputs = [clip.path]; o.zooms = ["1-4:1.4@0.47,0.29"]; o.zoomEase = 0.6
+        let composer = try Composer(plan: try await Planner.plan(o))
+        var focus: [(Double, Double)] = []
+        for k in 1..<36 {
+            let z = composer.zoomState(at: 1 + 0.6 * Double(k) / 36)
+            let w = 1 / z.scale
+            #expect(z.x - w / 2 >= -1e-9 && z.x + w / 2 <= 1 + 1e-9 && z.y - w / 2 >= -1e-9)
+            focus.append(((z.x - w / 2) / (1 - w), (z.y - w / 2) / (1 - w)))   // the point that stays put
+        }
+        let fx = focus.map(\.0), fy = focus.map(\.1)
+        #expect(fx.max()! - fx.min()! < 1e-6, "focal x drifts: \(fx.min()!)…\(fx.max()!)")
+        #expect(fy.max()! - fy.min()! < 1e-6, "focal y drifts: \(fy.min()!)…\(fy.max()!)")
+        let end = composer.zoomState(at: 2.5)
+        #expect(abs(end.scale - 1.4) < 1e-6 && abs(end.x - 0.47) < 1e-6)
+    }
+}

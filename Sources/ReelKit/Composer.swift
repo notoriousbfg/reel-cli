@@ -166,10 +166,20 @@ public final class Composer: @unchecked Sendable {
         }
         let a = k[i], b = k[i + 1]
         let u = smoothstep((t - a.t) / (b.t - a.t))
-        let pa = resolve(a.target, at: t), pb = resolve(b.target, at: t)
         // Interpolate scale geometrically so zoom speed looks uniform.
         let s = a.scale * pow(b.scale / a.scale, u)
-        return (s, pa.x + (pb.x - pa.x) * u, pa.y + (pb.y - pa.y) * u)
+        // Interpolate the visible rectangle, not the target: each end's rectangle is
+        // clamped to the frame, and its origin moves in proportion to its size. A zoom
+        // in or out then grows about one fixed point the whole way (clamping the target
+        // per frame made edge zooms head for the corner first, then slide sideways).
+        func origin(_ k: Keyframe) -> (x: Double, y: Double) {
+            let w = 1 / k.scale, p = resolve(k.target, at: t)
+            return (min(max(p.x - w / 2, 0), 1 - w), min(max(p.y - w / 2, 0), 1 - w))
+        }
+        let oa = origin(a), ob = origin(b)
+        let wa = 1 / a.scale, wb = 1 / b.scale, w = 1 / s
+        let f = abs(wb - wa) > 1e-9 ? (w - wa) / (wb - wa) : u
+        return (s, oa.x + (ob.x - oa.x) * f + w / 2, oa.y + (ob.y - oa.y) * f + w / 2)
     }
 
     /// Where a normalized output point lands after the zoom at time `t`.
