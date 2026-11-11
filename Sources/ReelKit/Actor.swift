@@ -15,6 +15,8 @@ public struct ActOptions: Sendable {
     public var typeRate = 14.0
     /// How far (points) the pointer may drift from where reel put it before aborting.
     public var tolerance = 6.0
+    /// How long a step waits for a marker its "at" names that hasn't arrived yet.
+    public var markerTimeout = 60.0
     public init(script: CursorScript) { self.script = script }
 }
 
@@ -56,8 +58,20 @@ public enum Actor {
         // Setup steps run first on act's own clock; the main steps then follow the
         // recording's clock (or a fresh one with --now / no recording).
         var clockStart = Date().timeIntervalSince1970
-        let setupSteps = try CursorScript(steps: o.script.setup ?? []).timeline(markers: [])
-        var steps = try o.script.timeline(markers: o.script.markers(base: state?.readMarks() ?? []))
+        typealias Planned = (t: Double?, index: Int, step: CursorScript.Step)
+        let setupSteps: [Planned] = try CursorScript(steps: o.script.setup ?? []).timeline(markers: []).map { ($0.t, $0.index, $0.step) }
+        // Steps in time order. If an "at" names a marker that hasn't arrived yet (the app
+        // sends it during the take), steps keep script order and each waits for its marker.
+        let hasRecording = state != nil
+        func plan() throws -> [Planned] {
+            let markers = o.script.markers(base: (try? RecordingState.current())?.readMarks() ?? [])
+            do { return try o.script.timeline(markers: markers).map { ($0.t, $0.index, $0.step) } }
+            catch {
+                guard hasRecording else { throw error }   // nothing will ever send the marker
+                return o.script.steps.enumerated().map { (try? $0.element.at.resolve(markers), $0.offset, $0.element) }
+            }
+        }
+        var steps = try plan()
         let wf = window.frame
         func screen(_ p: (Double, Double)) -> CGPoint { CGPoint(x: wf.minX + p.0 * wf.width, y: wf.minY + p.1 * wf.height) }
         func now() -> Double { Date().timeIntervalSince1970 - clockStart }
@@ -74,10 +88,10 @@ public enum Actor {
                     if let t0 = cur.captureStartedAt { clockStart = t0; state = cur; break }
                     try await Task.sleep(for: .milliseconds(10))
                 }
-                steps = try o.script.timeline(markers: o.script.markers(base: state?.readMarks() ?? []))
+                steps = try plan()
             } else if let t0 = st.t0 { clockStart = t0 }
-            if let first = steps.first, first.t < now() - 0.05 {
-                throw ReelError.message(String(format: "The recording is already at %.2fs but the script starts at %.2fs. Use --now to start the script clock now, or put the early steps under \"setup\".", now(), first.t))
+            if let ft = steps.first?.t, ft < now() - 0.05 {
+                throw ReelError.message(String(format: "The recording is already at %.2fs but the script starts at %.2fs. Use --now to start the script clock now, or put the early steps under \"setup\".", now(), ft))
             }
         }
 
@@ -109,23 +123,78 @@ public enum Actor {
         var completed = 0
         let started = now()
 
+        var touched = false          // act has posted pointer input
+        var lastRewarp = 0.0
+        func off() -> CGPoint? {
+            guard let actual = CGEvent(source: nil)?.location, hypot(actual.x - pos.x, actual.y - pos.y) > o.tolerance else { return nil }
+            return actual
+        }
         func checkUser() throws {
             if CGEventSource.keyState(.combinedSessionState, key: 53) { throw Aborted(reason: "Esc pressed", cause: "esc") }
-            if let actual = CGEvent(source: nil)?.location, hypot(actual.x - pos.x, actual.y - pos.y) > o.tolerance {
-                let moved = String(format: "(%.0f,%.0f → %.0f,%.0f)", pos.x, pos.y, actual.x, actual.y)
-                // Give the tap a moment to deliver the event that moved it.
-                Thread.sleep(forTimeInterval: 0.03)
+            guard touched else {
+                // Nothing of ours to protect yet: start from wherever the pointer is now.
+                if let actual = CGEvent(source: nil)?.location { pos = actual }
+                return
+            }
+            guard var actual = off() else { return }
+            func moved() -> String { String(format: "(%.0f,%.0f → %.0f,%.0f)", pos.x, pos.y, actual.x, actual.y) }
+            func foreign() throws {
                 switch watch.recentForeignInput(within: 1.0) {
                 case .person:
-                    throw Aborted(reason: "a person moved the mouse (hardware input) \(moved)", cause: "person")
+                    throw Aborted(reason: "a person moved the mouse (hardware input) \(moved())", cause: "person")
                 case .process(let pid):
                     let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
-                    throw Aborted(reason: "another process (\(name)) moved the pointer \(moved)", cause: "process")
-                case .none where watch.active:
-                    throw Aborted(reason: "the pointer wasn't where act left it \(moved), and no input event moved it (the app or macOS repositioned it)", cause: "displaced")
-                case .none:
-                    throw Aborted(reason: "the pointer moved \(moved); couldn't tell by whom (no Input Monitoring access)", cause: "unknown")
+                    throw Aborted(reason: "another process (\(name)) moved the pointer \(moved())", cause: "process")
+                case .none: break
                 }
+            }
+            // The window server applies posted events asynchronously (and an app can nudge
+            // the pointer, e.g. as a sheet opens): let it settle, then look again.
+            Thread.sleep(forTimeInterval: 0.05)
+            try foreign()
+            guard let again = off() else { return }
+            actual = again
+            guard watch.active else {
+                throw Aborted(reason: "the pointer moved \(moved()); couldn't tell by whom (no Input Monitoring access)", cause: "unknown")
+            }
+            // No person or process moved it: put it back once before giving up.
+            if now() - lastRewarp > 0.5 {
+                lastRewarp = now()
+                CGWarpMouseCursorPosition(pos)
+                CGEvent(mouseEventSource: nil, mouseType: buttonDown ? .leftMouseDragged : .mouseMoved, mouseCursorPosition: pos, mouseButton: .left)?
+                    .post(tap: .cghidEventTap)
+                Thread.sleep(forTimeInterval: 0.05)
+                try foreign()
+                guard let still = off() else {
+                    log("note: the pointer was displaced \(moved()) with no input event; put it back and carried on")
+                    return
+                }
+                actual = still
+            }
+            throw Aborted(reason: "the pointer wasn't where act left it \(moved()), and no input event moved it (the app or macOS repositioned it; putting it back didn't hold)", cause: "displaced")
+        }
+        /// A step's time; for a marker that hasn't arrived yet, waits for it.
+        func time(_ known: Double?, _ s: CursorScript.Step, _ label: String) async throws -> Double {
+            if let known { return known }
+            guard case .ref(let ref) = s.at else { return 0 }
+            let deadline = Date().addingTimeInterval(o.markerTimeout)
+            var told = false
+            while true {
+                guard let cur = try? RecordingState.current() else {
+                    throw ReelError.message("\(label): the recording ended while waiting for the marker in \"\(ref)\"")
+                }
+                let markers = o.script.markers(base: cur.readMarks())
+                if let t = try? TimeRef.resolve(ref, markers: markers) {
+                    // Markers are on the recording's clock; with --now act's clock started later.
+                    if o.now, let t0 = cur.t0 { return t - (clockStart - t0) }
+                    return t
+                }
+                if !told { log("\(label): waiting for the marker in \"\(ref)\"…"); told = true }
+                guard Date() < deadline else {
+                    throw ReelError.message("\(label): no marker for \"\(ref)\" within \(Int(o.markerTimeout))s. Markers so far: \(markers.map(\.label).joined(separator: ", "))")
+                }
+                try checkUser()
+                try await Task.sleep(for: .milliseconds(20))
             }
         }
         func wait(until t: Double) async throws {
@@ -139,6 +208,7 @@ public enum Actor {
             if type == .leftMouseDown || type == .leftMouseUp { e?.setIntegerValueField(.mouseEventClickState, value: clickState) }
             e?.post(tap: .cghidEventTap)
             pos = p
+            touched = true
         }
         /// Human-paced glide: eased, with a slight arc, arriving at `t1`.
         func glide(to target: CGPoint, from t0: Double, to t1: Double, linear: Bool = false) async throws {
@@ -172,9 +242,10 @@ public enum Actor {
                    window.title ?? "window", window.pid,
                    setupSteps.isEmpty ? "" : "\(setupSteps.count) setup + ", steps.count))
 
-        func run(_ list: [(t: Double, index: Int, step: CursorScript.Step)], prefix: String) async throws {
-            for (t, i, s) in list {
+        func run(_ list: [Planned], prefix: String) async throws {
+            for (known, i, s) in list {
                 let label = "\(prefix) \(i + 1)"
+                let t = try await time(known, s, label)
                 let lead = s.move != nil ? (s.over ?? CursorScript.defaultMove)
                     : (s.click.map { if case .at = $0 { return s.over ?? 0.35 } else { return 0 } } ?? 0)
                 try await wait(until: t - lead)
@@ -289,8 +360,8 @@ public enum Actor {
                         try await Task.sleep(for: .milliseconds(10))
                     }
                 }
-                steps = try o.script.timeline(markers: o.script.markers(base: (try? RecordingState.current())?.readMarks() ?? []))
-                if let first = steps.first, first.t < now() - 0.05 {
+                steps = try plan()
+                if let ft = steps.first?.t, ft < now() - 0.05 {
                     log(String(format: "warning: the recording is at %.2fs; steps before that run immediately", now()))
                 }
             } else if o.script.setup != nil {

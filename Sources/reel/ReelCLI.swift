@@ -42,7 +42,7 @@ struct Reel: AsyncParsableCommand {
             `locate`, `act` and `record --ax-snapshots` also need Accessibility.
             File formats (events sidecar, cursor scripts, presets, scenes): reel help formats
             """,
-        version: "0.5.1",
+        version: "0.5.2",
         subcommands: [Record.self, Shot.self, Stop.self, Mark.self, Windows.self, Edit.self, Run.self, Cursor.self,
                       Changes.self, Info.self, Frame.self, Sheet.self, Locate.self, Act.self, Doctor.self, Formats.self]
     )
@@ -1081,6 +1081,8 @@ struct Formats: ParsableCommand {
           {"coordinates": "window", "steps": [...]} makes them 0–1 of the app's window instead
             (the sidecar "window" rect), so one script fits window and `--display --app` takes,
             drawn or performed. Element targets are always found in the app window.
+          reel act: an "at" may name a marker that hasn't been sent yet ("sheet+1.5"); the step
+            waits for it (up to 60s). Steps then run in script order.
           reel act without --now follows the recording's clock; if the recording is waiting
             on --start-on, act waits for capture to start.
           Defaults: move "over" 0.6s, drag "over" 0.8s.

@@ -100,7 +100,8 @@ Optional, needs Accessibility (`reel doctor` shows `accessibility`):
   command, and the edit draws the recorded pointer (`"cursorFrom": "script"` to override).
   Add `"actCountdown": 3` (hands-off banner) and `"actRetries": 2` so a bumped mouse redoes
   the take instead of failing the scene. `abortCause` in act's JSON: `person`, `process`,
-  `displaced`, `esc`.
+  `displaced`, `esc`. Act steps can wait on markers the app sends mid-take
+  (`"at": "sheet+1.5"`); such scripts run in script order.
 
 Batches: put shared styling in `./reel.json` presets (`--preset promo`), or a whole
 take in a scene file and iterate with `reel run scene.json --edit-only --preview check.png`.

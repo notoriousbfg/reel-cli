@@ -103,7 +103,9 @@ drag states); its edit then draws the recorded pointer, so drawn and real can't 
 before the take, and `"actRetries": 2` redoes the take from prepare when act aborts,
 once the mouse has been still for 2 s. Act's abort message and `abortCause` say who
 moved the pointer: `person` (hardware input), `process` (another app posted input) or
-`displaced` (it moved without any input event).
+`displaced` (it moved without any input event; act first lets the pointer settle and
+puts it back once). An act step's `"at"` may name a marker that arrives during the take
+(`"sheet+1.5"`): the step waits for it.
 
 `reel help formats` documents every JSON file: the events sidecar, cursor
 scripts, presets and scene files.
