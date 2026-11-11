@@ -26,6 +26,10 @@ public struct RecordOptions: Sendable {
     public var cursorShapes = true     // note the on-screen cursor shape (I-beam, hand…) in the sidecar
     public var marksFile: URL?         // watch this file for "<label> <unix time>" lines (sandboxed harnesses)
     public var maxRestarts = 5         // restart capture this many times if macOS stops the stream
+    public var startOn: String?        // launch, but start capturing when this marker arrives (t=0)
+    public var stopOn: String?         // stop when this marker arrives (+ tail)
+    public var tail: Double = 0        // seconds to keep recording after the stop marker
+    public var markerTimeout: Double?  // bound on each marker wait; fails the take
     public var openURL: String?        // URL/file to open in the app (e.g. localhost for web devs)
     public var windowTitle: String?    // substring match on window title
     public var windowID: UInt32?
@@ -65,6 +69,31 @@ public struct RecordResult: Codable, Sendable {
     /// Seconds with no new frames while capture restarted (held frame in the video).
     public var gaps: [[Double]]?
     /// Set when --quit-after asked the app to quit.
+    public var quit: Bool?
+    /// What ended the take: duration, stop-marker, stop (Ctrl-C / reel stop), app-exit,
+    /// stream-error or timeout.
+    public var endedBy: String?
+    /// Set when --timeout expired waiting for the stop marker (the file is still finalised).
+    public var timedOut: String?
+}
+
+public struct ShotOptions: Sendable {
+    public var settle: Double = 0      // seconds to wait after the start marker (or the window appearing)
+    public var crop: String?
+    public var width: Int?
+    public var quality: Double = 0.9   // JPEG
+    public var keepOpen = false        // don't quit an app reel launched
+    public init() {}
+}
+
+public struct ShotResult: Codable, Sendable {
+    public var output: String
+    public var width: Int
+    public var height: Int
+    public var pid: Int32?
+    public var windowID: UInt32?
+    public var windowTitle: String?
+    public var markers: [RecordingEvents.Marker]?
     public var quit: Bool?
 }
 
@@ -119,25 +148,25 @@ public final class Recorder: @unchecked Sendable {
         // SCStream and CGEvent assert without one. NSApplication.shared establishes it.
         await MainActor.run { _ = NSApplication.shared }
 
-        var targetPID = opts.pid
-        var launchedNew = false
-        if let pid = opts.pid, NSRunningApplication(processIdentifier: pid) == nil {
-            throw ReelError.message("No running app with pid \(pid)")
+        if opts.startOn != nil && opts.countdown > 0 {
+            throw ReelError.message("--countdown and --start-on don't mix: t=0 is the moment the start marker arrives")
         }
-        if opts.pid == nil, let app = opts.app, opts.wantsLaunch {
-            let (running, isNew) = try await launch(app: app, log: log)
-            targetPID = running.processIdentifier
-            launchedNew = isNew
-            log("\(isNew ? "Launched" : "Activated") \(running.localizedName ?? app) (pid \(running.processIdentifier))")
-        }
-
         if opts.axSnapshots {
             try Accessibility.require("--ax-snapshots")
             if opts.display { throw ReelError.message("--ax-snapshots records one window; drop --display") }
         }
-        let target = try await resolveTarget(pid: targetPID, launchedNew: launchedNew, log: log)
-        let filter = target.filter
-        targetPID = targetPID ?? target.pid
+        let (target, targetPID, _) = try await prepareTarget(log: log)
+        let signals = StopSignals(exitOf: opts.untilExit ? targetPID : nil)
+        defer { signals.cancel() }
+        var (state, marksWatcher) = try arm(target: target, pid: targetPID, log: log)
+        defer { RecordingState.remove() }
+        defer { marksWatcher?.stop() }
+        var filter = target.filter
+        if let label = opts.startOn {
+            do { try await waitForStart(label, state: state, pid: targetPID, signals: signals, log: log) }
+            catch { _ = await quitIfAsked(targetPID, log: log); throw error }
+            if let fresh = await freshFilter(target) { filter = fresh }   // it may have moved during setup
+        }
         let info = SCShareableContent.info(for: filter)
         let scale = Double(info.pointPixelScale)
         let rect = info.contentRect
@@ -173,31 +202,29 @@ public final class Recorder: @unchecked Sendable {
         try await current.start()
         let t0 = CACurrentMediaTime()
         let startedAt = Date().timeIntervalSince1970
+        state.captureStartedAt = startedAt
+        state.captureRect = .init(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height)
+        try state.update()
         var parts: [(segment: CaptureSegment, offset: Double)] = [(current, 0)]
         let tracker = opts.trackCursor ? CursorTracker(captureRect: rect, start: t0, shapes: opts.cursorShapes) : nil
         tracker?.start()
         log("Recording \(target.label) at \(width)×\(height) → \(opts.output.path)")
-        log(opts.duration.map { "Stopping after \(String(format: "%.1f", $0))s (Ctrl-C to stop early)" }
+        log(opts.stopOn.map { "Stopping at marker \"\($0)\"" + (opts.tail > 0 ? String(format: " + %.1fs", opts.tail) : "") }
+            ?? opts.duration.map { "Stopping after \(String(format: "%.1f", $0))s (Ctrl-C to stop early)" }
             ?? (opts.untilExit ? "Stopping when the app quits (Ctrl-C or `reel stop` to stop early)"
                                : "Press Ctrl-C or run `reel stop` to finish"))
-
-        var state = RecordingState(pid: getpid(), output: opts.output.path, startedAt: startedAt)
-        state.targetPID = targetPID
-        state.windowID = target.windowID
-        state.captureRect = .init(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height)
-        try state.write()
-        defer { RecordingState.remove() }
         var snapper: Snapshotter?
         if opts.axSnapshots, let pid = targetPID {
             snapper = Snapshotter(window: .init(pid: pid, windowID: target.windowID, frame: rect, title: target.title),
                                   state: state, log: log)
             snapper?.start()
         }
-        let marksWatcher = opts.marksFile.map { MarksFileWatcher(file: $0, state: state, log: log) }
-        marksWatcher?.start()
 
-        // Control loop: stop requests, duration, app exit, and stream stops (restart if we can).
-        let signals = StopSignals(exitOf: opts.untilExit ? targetPID : nil)
+        // Control loop: stop requests, duration, markers, app exit, and stream stops (restart if we can).
+        var endedBy = "stop"
+        var timedOut: String?
+        var stopAt: Double?
+        var tick = 0
         var lastError: ErrorInfo?
         var endedEarly: ErrorInfo?
         var restarts = 0
@@ -211,8 +238,23 @@ public final class Recorder: @unchecked Sendable {
                 simulated.removeFirst()
                 await current.simulateStop()
             }
-            if signals.requested || signals.appExited { break }
-            if let d = opts.duration, elapsed >= d { break }
+            if signals.requested { endedBy = "stop"; break }
+            if signals.appExited { endedBy = "app-exit"; break }
+            if let d = opts.duration, elapsed >= d { endedBy = "duration"; break }
+            if let label = opts.stopOn {
+                tick += 1
+                if stopAt == nil, tick % 5 == 0,
+                   let m = state.readMarks().first(where: { $0.label == label && $0.t >= 0 }) {
+                    stopAt = m.t + opts.tail
+                    log(String(format: "Marker \"%@\" at %.2fs; stopping at %.2fs", label, m.t, m.t + opts.tail))
+                }
+                if let stopAt, elapsed >= stopAt { endedBy = "stop-marker"; break }
+                if stopAt == nil, let to = opts.markerTimeout, elapsed > to {
+                    timedOut = String(format: "No \"%@\" marker within %.0fs of the start; recording stopped", label, to)
+                    log(timedOut!)
+                    endedBy = "timeout"; break
+                }
+            }
             if let err = current.error {
                 let info = ErrorInfo(err)
                 lastError = info
@@ -221,9 +263,12 @@ public final class Recorder: @unchecked Sendable {
                 _ = await current.waitFinished(timeout: 5)     // keep what it wrote
                 let remaining = opts.duration.map { $0 - (CACurrentMediaTime() - t0) } ?? .infinity
                 let windowAlive = await Self.windowExists(target.windowID)
-                if signals.appExited || signals.requested || remaining < 0.5 { break }
+                if signals.appExited || signals.requested || remaining < 0.5 {
+                    endedBy = signals.appExited ? "app-exit" : signals.requested ? "stop" : "duration"; break
+                }
                 guard restarts < opts.maxRestarts, windowAlive else {
                     endedEarly = info
+                    endedBy = "stream-error"
                     log(windowAlive ? "Giving up after \(restarts) restarts" : "The window is gone; ending the recording")
                     break
                 }
@@ -238,6 +283,7 @@ public final class Recorder: @unchecked Sendable {
                     log(String(format: "Capture restarted at %.2fs (restart %d of %d)", offset, restarts, opts.maxRestarts))
                 } catch {
                     endedEarly = ErrorInfo(error)
+                    endedBy = "stream-error"
                     log("Could not restart capture: \(endedEarly!.summary)")
                     break
                 }
@@ -250,23 +296,17 @@ public final class Recorder: @unchecked Sendable {
         signals.cancel()
         tracker?.stop()
         marksWatcher?.stop()
+        marksWatcher = nil
         let snapshots = snapper?.stop() ?? []
         let markers = state.collectMarks()
+        let before = markers.filter { $0.t < 0 }
+        if !before.isEmpty {
+            log("\(before.count) marker(s) arrived before t=0 and are kept with negative times: "
+                + before.map { String(format: "%@ %.2fs", $0.label, $0.t) }.joined(separator: ", "))
+        }
 
         // --quit-after applies however the recording ended.
-        var quit: Bool?
-        if opts.quitAfter, let pid = targetPID, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated {
-            let name = app.localizedName ?? "the app"
-            var ok = app.terminate()
-            if ok {
-                // terminate() only asks; wait for the process to go so the result is true to its word.
-                let deadline = Date().addingTimeInterval(5)
-                while !app.isTerminated && kill(pid, 0) == 0 && Date() < deadline { try? await Task.sleep(for: .milliseconds(100)) }
-                ok = app.isTerminated || kill(pid, 0) != 0
-            }
-            quit = ok
-            log(ok ? "Quit \(name)" : "\(name) did not quit (it may be showing a dialog)")
-        }
+        let quit = await quitIfAsked(targetPID, log: log)
 
         // Finalise: one segment is renamed into place; several are joined on the t=0 timeline.
         let written = parts.filter { FileManager.default.fileExists(atPath: $0.segment.url.path) }
@@ -305,7 +345,130 @@ public final class Recorder: @unchecked Sendable {
                             duration: elapsed, app: opts.app, windowTitle: target.title, pid: targetPID,
                             windowID: target.windowID, markers: markers.isEmpty ? nil : markers,
                             stoppedEarly: endedEarly?.summary, stopError: lastError,
-                            restarts: restarts > 0 ? restarts : nil, gaps: gaps.isEmpty ? nil : gaps, quit: quit)
+                            restarts: restarts > 0 ? restarts : nil, gaps: gaps.isEmpty ? nil : gaps, quit: quit,
+                            endedBy: endedBy, timedOut: timedOut)
+    }
+
+    // MARK: - Shared phases (record and shot)
+
+    /// Launches or finds the app and resolves the window to capture.
+    private func prepareTarget(log: @escaping (String) -> Void) async throws -> (Target, Int32?, Bool) {
+        try Permissions.requireScreenRecording()
+        // A bare CLI has no window-server (CGS) connection; SCShareableContent.info(for:),
+        // SCStream and CGEvent assert without one. NSApplication.shared establishes it.
+        await MainActor.run { _ = NSApplication.shared }
+        var targetPID = opts.pid
+        var launchedNew = false
+        if let pid = opts.pid, NSRunningApplication(processIdentifier: pid) == nil {
+            throw ReelError.message("No running app with pid \(pid)")
+        }
+        if opts.pid == nil, let app = opts.app, opts.wantsLaunch {
+            let (running, isNew) = try await launch(app: app, log: log)
+            targetPID = running.processIdentifier
+            launchedNew = isNew
+            log("\(isNew ? "Launched" : "Activated") \(running.localizedName ?? app) (pid \(running.processIdentifier))")
+        }
+        let target = try await resolveTarget(pid: targetPID, launchedNew: launchedNew, log: log)
+        return (target, targetPID ?? target.pid, launchedNew)
+    }
+
+    /// Publishes the recording state before capture, so `reel mark`, --marks-file
+    /// and `reel act` (setup steps, start marker) work while reel waits.
+    private func arm(target: Target, pid: Int32?, log: @escaping (String) -> Void) throws -> (RecordingState, MarksFileWatcher?) {
+        var state = RecordingState(pid: getpid(), output: opts.output.path, startedAt: Date().timeIntervalSince1970)
+        state.targetPID = pid
+        state.windowID = target.windowID
+        state.startOn = opts.startOn
+        let r = SCShareableContent.info(for: target.filter).contentRect
+        state.captureRect = .init(x: r.minX, y: r.minY, width: r.width, height: r.height)
+        try state.write()
+        let watcher = opts.marksFile.map { MarksFileWatcher(file: $0, state: state, log: log) }
+        watcher?.start()
+        return (state, watcher)
+    }
+
+    private func waitForStart(_ label: String, state: RecordingState, pid: Int32?, signals: StopSignals,
+                              log: (String) -> Void) async throws {
+        log("Waiting for marker \"\(label)\"" + (opts.markerTimeout.map { String(format: " (timeout %.0fs)", $0) } ?? "")
+            + ": `reel mark \(label)`, --marks-file, or a `reel act` script with setup steps")
+        let start = Date()
+        while true {
+            if state.readMarks().contains(where: { $0.label == label }) { return }
+            if signals.requested { throw ReelError.message("Stopped before marker \"\(label)\" arrived; nothing was recorded") }
+            if let pid, kill(pid, 0) != 0 { throw ReelError.message("The app quit before marker \"\(label)\" arrived") }
+            if let to = opts.markerTimeout, Date().timeIntervalSince(start) > to {
+                throw ReelError.message(String(format: "Timed out after %.0fs waiting for marker \"%@\"; nothing was recorded", to, label))
+            }
+            try await Task.sleep(for: .milliseconds(15))
+        }
+    }
+
+    /// A filter for the window as it is now (setup may have moved or resized it).
+    private func freshFilter(_ target: Target) async -> SCContentFilter? {
+        guard !opts.display, let id = target.windowID,
+              let c = try? await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true),
+              let w = c.windows.first(where: { $0.windowID == id }) else { return nil }
+        return SCContentFilter(desktopIndependentWindow: w)
+    }
+
+    /// --quit-after: asks the app to quit and waits (up to 5s) for it to go.
+    private func quitIfAsked(_ pid: Int32?, force: Bool = false, log: (String) -> Void) async -> Bool? {
+        guard opts.quitAfter || force, let pid, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return nil }
+        let name = app.localizedName ?? "the app"
+        var ok = app.terminate()
+        if ok {
+            // terminate() only asks; wait for the process to go so the result is true to its word.
+            let deadline = Date().addingTimeInterval(5)
+            while !app.isTerminated && kill(pid, 0) == 0 && Date() < deadline { try? await Task.sleep(for: .milliseconds(100)) }
+            ok = app.isTerminated || kill(pid, 0) != 0
+        }
+        log(ok ? "Quit \(name)" : "\(name) did not quit (it may be showing a dialog)")
+        return ok
+    }
+
+    // MARK: - Still image (reel shot)
+
+    public func shot(_ s: ShotOptions, log: @escaping (String) -> Void) async throws -> ShotResult {
+        let (target, targetPID, launchedNew) = try await prepareTarget(log: log)
+        let signals = StopSignals(exitOf: nil)
+        defer { signals.cancel() }
+        var (state, watcher) = try arm(target: target, pid: targetPID, log: log)
+        defer { RecordingState.remove() }
+        defer { watcher?.stop() }
+        let quitAtEnd = !s.keepOpen && (opts.quitAfter || launchedNew)
+        do {
+            if let label = opts.startOn {
+                try await waitForStart(label, state: state, pid: targetPID, signals: signals, log: log)
+            }
+            if s.settle > 0 { try await Task.sleep(for: .seconds(s.settle)) }
+            let filter = await freshFilter(target) ?? target.filter
+            let info = SCShareableContent.info(for: filter)
+            let scale = Double(info.pointPixelScale)
+            let config = SCStreamConfiguration()
+            config.width = Int((info.contentRect.width * scale).rounded())
+            config.height = Int((info.contentRect.height * scale).rounded())
+            config.showsCursor = opts.showsCursor
+            config.captureResolution = .best
+            var image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            state.captureStartedAt = Date().timeIntervalSince1970
+            try? state.update()
+            if let crop = s.crop { image = try Stills.crop(image, crop) }
+            try Stills.writeImage(image, to: opts.output, maxWidth: s.width, quality: s.quality)
+            let written = (CGImageSourceCreateWithURL(opts.output as CFURL, nil)
+                .flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] }) ?? [:]
+            log("Saved \(target.label) → \(opts.output.path)")
+            let markers = state.collectMarks()
+            watcher?.stop(); watcher = nil
+            let quit = quitAtEnd ? await quitIfAsked(targetPID, force: true, log: log) : nil
+            return ShotResult(output: opts.output.path,
+                              width: written[kCGImagePropertyPixelWidth] as? Int ?? image.width,
+                              height: written[kCGImagePropertyPixelHeight] as? Int ?? image.height,
+                              pid: targetPID, windowID: target.windowID, windowTitle: target.title,
+                              markers: markers.isEmpty ? nil : markers, quit: quit)
+        } catch {
+            if quitAtEnd { _ = await quitIfAsked(targetPID, force: true, log: log) }
+            throw error
+        }
     }
 
     static func windowExists(_ id: UInt32?) async -> Bool {
@@ -635,6 +798,15 @@ public struct RecordingState: Codable, Sendable {
     public var targetPID: Int32?
     public var windowID: UInt32?
     public var captureRect: RecordingEvents.Rect?
+    /// With --start-on: the marker capture waits for, and the Unix time capture began.
+    /// `startedAt` is then the time reel armed; marks are stored relative to it and
+    /// shifted onto the capture clock (earlier ones become negative).
+    public var startOn: String?
+    public var captureStartedAt: Double?
+
+    /// Unix time of the capture's t=0 (nil while waiting for the start marker).
+    public var t0: Double? { startOn == nil ? startedAt : captureStartedAt }
+    var shift: Double { (captureStartedAt ?? startedAt) - startedAt }
 
     public init(pid: Int32, output: String, startedAt: Double) {
         self.pid = pid; self.output = output; self.startedAt = startedAt
@@ -645,8 +817,10 @@ public struct RecordingState: Codable, Sendable {
 
     func write() throws {
         try? FileManager.default.removeItem(at: marksURL)
-        try JSONEncoder().encode(self).write(to: Self.url, options: .atomic)
+        try update()
     }
+    /// Rewrites the state, keeping markers.
+    func update() throws { try JSONEncoder().encode(self).write(to: Self.url, options: .atomic) }
     static func remove() { try? FileManager.default.removeItem(at: url) }
 
     /// The recording in progress, if its process is still alive.
@@ -669,9 +843,9 @@ public struct RecordingState: Codable, Sendable {
 
     /// Appends a marker at the current moment of the running recording.
     public func mark(_ label: String, offset: Double = 0) throws -> RecordingEvents.Marker {
-        let m = RecordingEvents.Marker(label: label, t: ((Date().timeIntervalSince1970 - startedAt + offset) * 1000).rounded() / 1000)
-        try append(m)
-        return m
+        let raw = Date().timeIntervalSince1970 - startedAt + offset
+        try append(.init(label: label, t: (raw * 1000).rounded() / 1000))
+        return .init(label: label, t: ((raw - shift) * 1000).rounded() / 1000)
     }
 
     /// Appends a marker with an explicit time (e.g. from a marks file).
@@ -687,10 +861,12 @@ public struct RecordingState: Codable, Sendable {
         }
     }
 
-    /// Markers so far (leaves them in place).
+    /// Markers so far on the capture clock (leaves them in place).
     public func readMarks() -> [RecordingEvents.Marker] {
         guard let text = try? String(contentsOf: marksURL, encoding: .utf8) else { return [] }
+        let d = shift
         return text.split(separator: "\n").compactMap { try? JSONDecoder().decode(RecordingEvents.Marker.self, from: Data($0.utf8)) }
+            .map { .init(label: $0.label, t: (($0.t - d) * 1000).rounded() / 1000) }
             .sorted { $0.t < $1.t }
     }
 
@@ -716,6 +892,7 @@ final class Snapshotter: @unchecked Sendable {
     }
 
     func start() {
+        seen = state.readMarks().count   // markers from before t=0 don't get snapshots
         queue.async { self.snap(t: 0, marker: nil) }
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 0.15, repeating: .milliseconds(120))

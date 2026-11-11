@@ -354,6 +354,11 @@ public enum Stills {
     }
 
     public static func writePNG(_ image: CGImage, to url: URL, maxWidth: Int? = nil) throws {
+        try writeImage(image, to: url, maxWidth: maxWidth)
+    }
+
+    /// PNG, or JPEG for .jpg/.jpeg (at `quality`, 0–1).
+    public static func writeImage(_ image: CGImage, to url: URL, maxWidth: Int? = nil, quality: Double = 0.9) throws {
         var img = image
         if let maxWidth, image.width > maxWidth {
             let h = Int(Double(image.height) * Double(maxWidth) / Double(image.width))
@@ -364,10 +369,12 @@ public enum Stills {
             ctx.draw(image, in: CGRect(x: 0, y: 0, width: maxWidth, height: h))
             img = ctx.makeImage()!
         }
-        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+        let jpeg = ["jpg", "jpeg"].contains(url.pathExtension.lowercased())
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, (jpeg ? UTType.jpeg : UTType.png).identifier as CFString, 1, nil) else {
             throw ReelError.message("Cannot write \(url.path)")
         }
-        CGImageDestinationAddImage(dest, img, nil)
+        let props = jpeg ? [kCGImageDestinationLossyCompressionQuality: max(0, min(1, quality))] as CFDictionary : nil
+        CGImageDestinationAddImage(dest, img, props)
         guard CGImageDestinationFinalize(dest) else { throw ReelError.message("Cannot write \(url.path)") }
     }
 }

@@ -40,7 +40,7 @@ public enum Actor {
         await AppKitSession.ensure()
 
         // Target window and clock: the running recording unless told otherwise.
-        let state = try? RecordingState.current()
+        var state = try? RecordingState.current()
         let window: Accessibility.WindowRef
         if o.pid != nil || o.windowID != nil {
             window = try Accessibility.window(pid: o.pid, windowID: o.windowID)
@@ -49,15 +49,20 @@ public enum Actor {
         } else {
             throw ReelError.message("No target: start `reel record` first, or pass --pid / --window-id")
         }
-        let clockStart = (o.now || state == nil) ? Date().timeIntervalSince1970 : state!.startedAt
-        let recorded = state?.readMarks() ?? []
-        let steps = try o.script.timeline(markers: o.script.markers(base: recorded))
+        // Setup steps run first on act's own clock; the main steps then follow the
+        // recording's clock (or a fresh one with --now / no recording).
+        var clockStart = Date().timeIntervalSince1970
+        let setupSteps = try CursorScript(steps: o.script.setup ?? []).timeline(markers: [])
+        var steps = try o.script.timeline(markers: o.script.markers(base: state?.readMarks() ?? []))
         let wf = window.frame
         func screen(_ p: (Double, Double)) -> CGPoint { CGPoint(x: wf.minX + p.0 * wf.width, y: wf.minY + p.1 * wf.height) }
         func now() -> Double { Date().timeIntervalSince1970 - clockStart }
 
-        if let first = steps.first, state != nil, !o.now, first.t < now() - 0.05 {
-            throw ReelError.message(String(format: "The recording is already at %.2fs but the script starts at %.2fs. Use --now to start the script clock now.", now(), first.t))
+        if o.script.setup == nil, let state, !o.now {
+            if let t0 = state.t0 { clockStart = t0 }
+            if let first = steps.first, first.t < now() - 0.05 {
+                throw ReelError.message(String(format: "The recording is already at %.2fs but the script starts at %.2fs. Use --now to start the script clock now, or put the early steps under \"setup\".", now(), first.t))
+            }
         }
 
         let resolver = CursorScript.Resolver(width: wf.width, height: wf.height, scale: 1, element: { ref, _ in
@@ -119,13 +124,13 @@ public enum Actor {
         }
 
         if let app = NSRunningApplication(processIdentifier: window.pid) { app.activate() }
-        log(String(format: "Acting on %@ (pid %d): %d steps. Move the mouse or press Esc to abort.",
-                   window.title ?? "window", window.pid, steps.count))
+        log(String(format: "Acting on %@ (pid %d): %@%d steps. Move the mouse or press Esc to abort.",
+                   window.title ?? "window", window.pid,
+                   setupSteps.isEmpty ? "" : "\(setupSteps.count) setup + ", steps.count))
 
-        var aborted: String?
-        do {
-            for (t, i, s) in steps {
-                let label = "step \(i + 1)"
+        func run(_ list: [(t: Double, index: Int, step: CursorScript.Step)], prefix: String) async throws {
+            for (t, i, s) in list {
+                let label = "\(prefix) \(i + 1)"
                 let lead = s.move != nil ? (s.over ?? CursorScript.defaultMove)
                     : (s.click.map { if case .at = $0 { return s.over ?? 0.35 } else { return 0 } } ?? 0)
                 try await wait(until: t - lead)
@@ -202,12 +207,52 @@ public enum Actor {
                 }
                 completed += 1
             }
+        }
+
+        var aborted: String?
+        do {
+            if !setupSteps.isEmpty { try await run(setupSteps, prefix: "setup step") }
+            if o.script.setup != nil, let st = state, !o.now {
+                if st.t0 == nil, let label = st.startOn {
+                    // The recording is waiting for its start marker: setup is done, so send it.
+                    if !st.readMarks().contains(where: { $0.label == label }) {
+                        marks.append(try st.mark(label))
+                        log("Setup done; sent start marker \"\(label)\"")
+                    }
+                    let deadline = Date().addingTimeInterval(30)
+                    var t0: Double?
+                    while t0 == nil {
+                        t0 = (try? RecordingState.current())?.captureStartedAt
+                        if t0 == nil {
+                            guard (try? RecordingState.current()) != nil else { throw ReelError.message("The recording ended before capture started") }
+                            guard Date() < deadline else { throw ReelError.message("Capture didn't start within 30s of the start marker") }
+                            try await Task.sleep(for: .milliseconds(10))
+                        }
+                    }
+                    clockStart = t0!
+                    // Report markers on the capture clock from here on.
+                    if let fresh = try? RecordingState.current() {
+                        state = fresh
+                        let now = fresh.readMarks()
+                        marks = marks.map { m in now.first { $0.label == m.label } ?? m }
+                    }
+                } else if let t0 = st.t0 {
+                    clockStart = t0
+                }
+                steps = try o.script.timeline(markers: o.script.markers(base: (try? RecordingState.current())?.readMarks() ?? []))
+                if let first = steps.first, first.t < now() - 0.05 {
+                    log(String(format: "warning: the recording is at %.2fs; steps before that run immediately", now()))
+                }
+            } else if o.script.setup != nil {
+                clockStart = Date().timeIntervalSince1970
+            }
+            try await run(steps, prefix: "step")
         } catch let a as Aborted {
             aborted = a.reason
         }
         if buttonDown { CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: pos, mouseButton: .left)?.post(tap: .cghidEventTap) }
         if let aborted { log("Aborted: \(aborted). Released the mouse.") }
-        return ActResult(steps: steps.count, completed: completed, aborted: aborted, duration: now() - started,
+        return ActResult(steps: setupSteps.count + steps.count, completed: completed, aborted: aborted, duration: now() - started,
                          markers: marks, window: .init(x: wf.minX, y: wf.minY, width: wf.width, height: wf.height), pid: window.pid)
     }
 }

@@ -178,10 +178,12 @@ public struct CursorScript: Sendable {
     }
 
     public var steps: [Step]
+    /// `reel act` only: steps performed before the recording starts (ignored when drawing).
+    public var setup: [Step]?
 
-    public init(steps: [Step]) { self.steps = steps }
+    public init(steps: [Step], setup: [Step]? = nil) { self.steps = steps; self.setup = setup }
 
-    /// Accepts a JSON array of steps, or {"steps": [...]}.
+    /// Accepts a JSON array of steps, or {"setup": [...], "steps": [...]}.
     public static func load(_ url: URL) throws -> CursorScript {
         let data: Data
         do { data = try Data(contentsOf: url) } catch { throw ReelError.message("Cannot read cursor script \(url.path)") }
@@ -189,10 +191,12 @@ public struct CursorScript: Sendable {
     }
 
     public static func parse(_ data: Data, name: String = "cursor script") throws -> CursorScript {
-        struct Wrapped: Decodable { var steps: [Step] }
+        struct Wrapped: Decodable { var steps: [Step]?; var setup: [Step]? }
         do {
             if let steps = try? JSONDecoder().decode([Step].self, from: data) { return .init(steps: steps) }
-            return .init(steps: try JSONDecoder().decode(Wrapped.self, from: data).steps)
+            let w = try JSONDecoder().decode(Wrapped.self, from: data)
+            guard w.steps != nil || w.setup != nil else { throw ReelError.message("\(name): expected an array of steps or {\"steps\": [...]}") }
+            return .init(steps: w.steps ?? [], setup: w.setup)
         } catch let e as DecodingError {
             throw ReelError.message("\(name): \(Self.describe(e))")
         }

@@ -61,6 +61,12 @@ When the app was driven by a harness (no real mouse), write a cursor script
 `"shape": "ibeam"` over text fields. Warnings about overlapping steps mean a move
 was delayed; fix the times.
 
+Start in the right state: `--start-on ready` launches the app but captures only from the
+`ready` marker (t=0), `--stop-on done --tail 1.5` ends the take, `--timeout 60` fails a
+take whose marker never comes (exit 1 before capture, 4 after). Put pre-roll actions in
+an act script's `"setup"` list. Scenes take `"prepare"`/`"teardown"` commands and
+`${VAR}`s; `{"shot": {...}}` (or `reel shot`) makes a still instead of a video.
+
 Markers from a sandboxed app: have it append `<label> <unix time>` lines to a file it can
 write, and pass `--marks-file <file>` to `reel record` (or `reel mark --import <file> --clip raw.mov`
 afterwards).

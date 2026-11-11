@@ -49,6 +49,9 @@ reel record --app Grasmere --launch --no-cursor --countdown 3 --duration 25 -o r
 reel record --app Safari --open http://localhost:3000 -o site.mov          # websites
 reel record --app build/Debug/Grasmere.app --new-instance --env DEMO=1 \
   --args "-AppleLanguages (en)" --until-exit --quit-after -o raw.mov       # driven by a test harness
+reel record --app Grasmere --new-instance --start-on ready --stop-on done --tail 1.5 \
+  --timeout 60 --quit-after -o raw.mov   # capture only between the harness's markers
+reel shot --app Grasmere --new-instance --start-on ready --settle 0.5 -o hero.png   # a still
 reel mark saved                          # from the harness, while recording
 reel record … --marks-file marks.txt     # sandboxed harness: it appends "<label> <unix time>" lines
 reel mark --import marks.txt --clip raw.mov   # …or import them afterwards
@@ -67,7 +70,7 @@ reel edit raw.mov:1.2-22 --preset promo --cursor 1.8 \
 reel edit raw.mov:1.2-22 … -o promo.mp4
 
 # Or describe the whole take once and re-run it
-reel run scene.json                      # record + edit
+reel run scene.json                      # prepare → record (or shot) → edit → teardown
 reel run scene.json --edit-only --preview check.png
 ```
 
@@ -77,6 +80,13 @@ holding a frame across each short gap. The JSON reports `restarts`, `gaps` and
 `stopError` (domain, code, description). A `--duration` take that still ends
 short exits with code 3; the file is always finalised and `--quit-after` still
 applies.
+
+With `--start-on`, reel launches the app but begins capturing only when that
+marker arrives, so set-up never appears in the take; markers sent while waiting
+keep negative times. `reel act` scripts can carry a `"setup"` list performed
+before capture: act runs it, sends the start marker, then performs `"steps"` on
+camera. Scenes add `"prepare"` and `"teardown"` shell commands; prepare can
+print `KEY=VALUE` lines used later as `${KEY}`.
 
 `reel help formats` documents every JSON file: the events sidecar, cursor
 scripts, presets and scene files.

@@ -299,3 +299,32 @@ import Testing
         #expect(info.summary.contains("SCStreamErrorDomain -3805") && info.summary.contains("inner 7: deep"))
     }
 }
+
+@Suite struct SetupPhaseTests {
+    @Test func marksShiftOntoCaptureClock() throws {
+        var st = RecordingState(pid: 999_991, output: "/tmp/x.mov", startedAt: 1000)
+        st.startOn = "ready"
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("reel-marks-999991.jsonl")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try? FileManager.default.removeItem(at: file)
+        try st.append(.init(label: "early", t: 1.0))     // relative to arming
+        try st.append(.init(label: "ready", t: 2.5))
+        #expect(st.t0 == nil)
+        #expect(st.readMarks().map(\.t) == [1.0, 2.5])
+        st.captureStartedAt = 1002.6                     // capture began 2.6s after arming
+        #expect(st.t0 == 1002.6)
+        #expect(st.readMarks().map(\.t) == [-1.6, -0.1])
+        // Negative markers still resolve as references.
+        #expect(abs(try TimeRef.resolve("early+0.5", markers: st.readMarks()) + 1.1) < 1e-9)
+    }
+
+    @Test func scriptWithSetup() throws {
+        let s = try CursorScript.parse(Data(#"{"setup": [{"at": 0, "key": "cmd+n"}], "steps": [{"at": 0, "move": [0.5, 0.5], "over": 0}, {"at": 1, "click": true}]}"#.utf8))
+        #expect(s.setup?.count == 1 && s.steps.count == 2)
+        // Drawing ignores setup.
+        let ev = try s.events(base: nil, pointsSize: (100, 100), pointPixelScale: 2, duration: 2)
+        #expect(ev.clicks.count == 1)
+        #expect(try CursorScript.parse(Data(#"{"setup": []}"#.utf8)).steps.isEmpty)
+        #expect(throws: (any Error).self) { try CursorScript.parse(Data(#"{"nope": 1}"#.utf8)) }
+    }
+}
