@@ -518,12 +518,24 @@ import CoreImage
         #expect(d[0] < before[0] - 0.2 && d[0] > d[1] + 0.2)
     }
 
-    /// A frame as bright as the still, or brighter, leaves it alone.
-    @Test func neverBrightens() {
+    /// A pale scrim over a dark window: the bar lifts to meet the frame and the dot stays red.
+    @Test func stillLiftsWithTheFrame() {
+        let r = CGRect(x: 0, y: 0, width: 180, height: 80)
+        let dot = CIImage(color: CIColor(red: 1, green: 0.2, blue: 0.2)).cropped(to: CGRect(x: 20, y: 30, width: 20, height: 20))
+        let still = dot.composited(over: CIImage(color: CIColor(red: 0.06, green: 0.06, blue: 0.07)).cropped(to: r))
+        let lit = CIImage(color: CIColor(red: 0.12, green: 0.12, blue: 0.13)).cropped(to: r)
+        let out = Composer.toneMatched(still, to: lit)
+        let bar = Self.rgb(out, at: CGPoint(x: 100, y: 40)), want = Self.rgb(lit, at: CGPoint(x: 100, y: 40))
+        for (a, b) in zip(bar, want) { #expect(abs(a - b) < 0.02) }
+        let d = Self.rgb(out, at: CGPoint(x: 30, y: 40))
+        #expect(d[0] > 0.9 && d[1] < 0.4)
+    }
+
+    /// A frame that matches the still leaves it alone.
+    @Test func unchangedWhenTheFrameMatches() {
         let r = CGRect(x: 0, y: 0, width: 180, height: 80)
         let still = CIImage(color: CIColor(red: 0.6, green: 0.6, blue: 0.6)).cropped(to: r)
-        let bright = CIImage(color: CIColor(red: 0.9, green: 0.9, blue: 0.9)).cropped(to: r)
-        let a = Self.rgb(Composer.toneMatched(still, to: bright), at: CGPoint(x: 90, y: 40))
+        let a = Self.rgb(Composer.toneMatched(still, to: still), at: CGPoint(x: 90, y: 40))
         let b = Self.rgb(still, at: CGPoint(x: 90, y: 40))
         for (x, y) in zip(a, b) { #expect(abs(x - y) < 0.02) }
     }

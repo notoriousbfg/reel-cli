@@ -38,8 +38,8 @@ public struct RecordingEvents: Codable, Sendable {
         public var end: Double?
         /// Pixels over which the right and bottom edges blend into the footage.
         public var feather: Double?
-        /// Darken the image as the footage at its right edge has darkened since the still
-        /// was taken (a sheet or modal dimming the window). Recorded patches default to true.
+        /// Shift the image's tone as the footage at its right edge has changed since the
+        /// still was taken (a sheet or modal's scrim over the window). Recorded patches default to true.
         public var matchTone: Bool?
         public init(image: String, x: Double, y: Double, width: Double, height: Double,
                     start: Double? = nil, end: Double? = nil, feather: Double? = nil, matchTone: Bool? = nil) {

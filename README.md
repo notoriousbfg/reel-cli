@@ -36,7 +36,7 @@ the click data that powers `--auto-zoom` and `@cursor`).
 While recording, macOS shows a purple "being shared" pill in place of the window's
 traffic lights. Record with `--clean-titlebar` and reel stores a still of that corner
 (taken before capture, and again after any restart); `reel edit` draws it back over
-the pill automatically, darkening it to match when a sheet or modal dims the window.
+the pill automatically, re-toning it to match when a sheet or modal dims the window.
 Or crop past the title bar.
 
 Window capture shows only the window itself. Add `--include-child-windows` to also

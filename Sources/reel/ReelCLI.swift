@@ -1050,7 +1050,7 @@ struct Formats: ParsableCommand {
                          "start": 2.01, "end": null, "feather": 16, "matchTone": true}],
                 // record --clean-titlebar: drawn over the source (px) by `reel edit`, before crop
                 // and zoom; one per capture segment; --no-recorded-patches to skip. matchTone
-                // (default true here) darkens the still when a sheet or modal dims the window
+                // (default true here) re-tones the still when a sheet or modal's scrim covers the window
             "startedAt": 1762859000.12,                 // Unix time of t=0
             "cursorInVideo": false,                     // was the system cursor captured?
             "synthetic": true                           // generated from a cursor script

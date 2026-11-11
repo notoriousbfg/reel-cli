@@ -58,21 +58,38 @@ public final class Composer: @unchecked Sendable {
         patchImages = imgs
     }
 
-    /// `still` darkened by as much as `frame` is darker than it in the strip at the
-    /// still's right edge, which the capture pill never covers. A still taken before a
-    /// sheet or modal dimmed the window then dims with it. Never brightens.
+    /// `still` shifted to the tone `frame` has in the strip at the still's right edge,
+    /// which the capture pill never covers. A still taken before a sheet or modal put a
+    /// scrim over the window then changes with it: where the frame is darker the still
+    /// is scaled down, where it is lighter (a pale scrim over a dark window) the
+    /// difference is added, so the bar around the buttons always meets the footage.
     static func toneMatched(_ still: CIImage, to frame: CIImage) -> CIImage {
         let r = still.extent
         let strip = CGRect(x: r.maxX - r.width * 0.15, y: r.minY, width: r.width * 0.15, height: r.height * 0.85)
         func average(_ image: CIImage) -> CIImage {
             image.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: strip)]).clampedToExtent()
         }
+        func clamped(_ image: CIImage, alpha: CGFloat) -> CIImage {
+            image.applyingFilter("CIColorClamp", parameters: ["inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: alpha),
+                                                              "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: alpha)])
+        }
+        /// a + b per channel for two opaque images (adding premultiplied pixels doubles
+        /// alpha, which the matrix undoes without scaling the colour).
+        func sum(_ a: CIImage, _ b: CIImage) -> CIImage {
+            a.applyingFilter("CIAdditionCompositing", parameters: [kCIInputBackgroundImageKey: b])
+                .applyingFilter("CIColorMatrix", parameters: [
+                    "inputRVector": CIVector(x: 2, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 0, y: 2, z: 0, w: 0),
+                    "inputBVector": CIVector(x: 0, y: 0, z: 2, w: 0), "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0.5)])
+        }
+        let was = average(still), now = average(frame)
         // CIDivideBlendMode: background ÷ input, per channel.
-        let gain = average(still)
-            .applyingFilter("CIDivideBlendMode", parameters: [kCIInputBackgroundImageKey: average(frame)])
-            .applyingFilter("CIColorClamp", parameters: ["inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 1),
-                                                         "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)])
-        return still.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: gain])
+        let gain = clamped(was.applyingFilter("CIDivideBlendMode", parameters: [kCIInputBackgroundImageKey: now]), alpha: 1)
+        let negated = was.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: -1, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 0, y: -1, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: -1, w: 0)])
+        let lift = clamped(sum(now, negated), alpha: 1)
+        let scaled = still.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: gain])
+        return clamped(sum(scaled.composited(over: CIImage.black), lift), alpha: 1)
             .applyingFilter("CIBlendWithAlphaMask", parameters: [kCIInputBackgroundImageKey: CIImage.empty(), kCIInputMaskImageKey: still])
             .cropped(to: r)
     }
