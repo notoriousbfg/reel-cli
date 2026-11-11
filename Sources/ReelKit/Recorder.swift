@@ -28,6 +28,8 @@ public struct RecordOptions: Sendable {
     public var maxRestarts = 5         // restart capture this many times if macOS stops the stream
     public var startOn: String?        // launch, but start capturing when this marker arrives (t=0)
     public var stopOn: String?         // stop when this marker arrives (+ tail)
+    public var failOn: String?         // end the take at once, as failed, when this marker arrives
+    public var also: [String] = []     // --display --app: other apps whose windows are recorded too
     public var tail: Double = 0        // seconds to keep recording after the stop marker
     public var markerTimeout: Double?  // bound on each marker wait; fails the take
     public var cleanTitlebar = false
@@ -82,6 +84,9 @@ public struct RecordResult: Codable, Sendable {
     public var endedBy: String?
     /// Set when --timeout expired waiting for the stop marker (the file is still finalised).
     public var timedOut: String?
+    /// Set when the take was ended as failed (--fail-on's marker, `reel stop --fail`,
+    /// `reel act --stop-recording-on-error`). The file is kept; `reel record` exits 5.
+    public var failed: String?
 }
 
 public struct ShotOptions: Sendable {
@@ -147,6 +152,9 @@ public enum Windows {
 
 public final class Recorder: @unchecked Sendable {
     private let opts: RecordOptions
+    /// When this take began (before the app is launched). Marks-file lines stamped earlier
+    /// belong to an older take and are ignored.
+    private let began = Date().timeIntervalSince1970
 
     public init(options: RecordOptions) { self.opts = options }
 
@@ -165,6 +173,9 @@ public final class Recorder: @unchecked Sendable {
             if opts.display && opts.app == nil && opts.pid == nil {
                 throw ReelError.message("--ax-snapshots with --display needs --app or --pid to know which window")
             }
+        }
+        if !opts.also.isEmpty && !(opts.display && (opts.app != nil || opts.pid != nil)) {
+            throw ReelError.message("--also adds other apps' windows to a display take of one app: use it with --display and --app or --pid")
         }
         if opts.includeChildWindows && opts.display {
             throw ReelError.message("--include-child-windows records one window (with its popovers); drop --display")
@@ -190,7 +201,9 @@ public final class Recorder: @unchecked Sendable {
             }
         }
         // Measured now, after any setup that moved or resized the window.
-        let geo = try await geometry(target)
+        let geo: Geometry
+        do { geo = try await geometry(target) }
+        catch { _ = await quitIfAsked(targetPID, log: log); throw error }
         let filter = geo.filter
         let scale = geo.scale
         let rect = geo.rect
@@ -294,6 +307,7 @@ public final class Recorder: @unchecked Sendable {
         // Control loop: stop requests, duration, markers, app exit, and stream stops (restart if we can).
         var endedBy = "stop"
         var timedOut: String?
+        var failed: String?
         var stopAt: Double?
         var tick = 0
         var lastError: ErrorInfo?
@@ -316,8 +330,13 @@ public final class Recorder: @unchecked Sendable {
                 break
             }
             if let d = opts.duration, elapsed >= d { endedBy = "duration"; break }
+            tick += 1
+            if tick % 5 == 0, let reason = failure(state) {
+                failed = reason
+                log(String(format: "Take failed at %.2fs: %@", elapsed, reason))
+                endedBy = "failed"; break
+            }
             if let label = opts.stopOn {
-                tick += 1
                 if stopAt == nil, tick % 5 == 0,
                    let m = state.readMarks().first(where: { $0.label == label && $0.t >= 0 }) {
                     stopAt = m.t + opts.tail
@@ -444,7 +463,15 @@ public final class Recorder: @unchecked Sendable {
                             stoppedEarly: endedEarly?.summary, stopError: lastError,
                             restarts: restarts, lostSeconds: (gaps.reduce(0) { $0 + $1[1] - $1[0] } * 1000).rounded() / 1000,
                             gaps: gaps.isEmpty ? nil : gaps, quit: quit, forcedQuit: forced,
-                            endedBy: endedBy, timedOut: timedOut)
+                            endedBy: endedBy, timedOut: timedOut, failed: failed)
+    }
+
+    /// Why the take should end as failed, if it should: a `reel stop --fail` request
+    /// or --fail-on's marker.
+    private func failure(_ state: RecordingState) -> String? {
+        if let reason = state.failRequest() { return reason }
+        if let label = opts.failOn, state.readMarks().contains(where: { $0.label == label }) { return "marker \"\(label)\" arrived" }
+        return nil
     }
 
     // MARK: - Shared phases (record and shot)
@@ -480,7 +507,7 @@ public final class Recorder: @unchecked Sendable {
         let r = SCShareableContent.info(for: target.filter).contentRect
         state.captureRect = .init(x: r.minX, y: r.minY, width: r.width, height: r.height)
         try state.write()
-        let watcher = opts.marksFile.map { MarksFileWatcher(file: $0, state: state, log: log) }
+        let watcher = opts.marksFile.map { MarksFileWatcher(file: $0, state: state, since: began, log: log) }
         watcher?.start()
         return (state, watcher)
     }
@@ -492,6 +519,7 @@ public final class Recorder: @unchecked Sendable {
         let start = Date()
         while true {
             if state.readMarks().contains(where: { $0.label == label }) { return }
+            if let reason = failure(state) { throw ReelError.message("The take failed before capture started (\(reason)); nothing was recorded") }
             if signals.requested { throw ReelError.message("Stopped before marker \"\(label)\" arrived; nothing was recorded") }
             if let pid, kill(pid, 0) != 0 { throw ReelError.message("The app quit before marker \"\(label)\" arrived") }
             if let to = opts.markerTimeout, Date().timeIntervalSince(start) > to {
@@ -532,7 +560,15 @@ public final class Recorder: @unchecked Sendable {
                             rect: CGRect(x: src.minX + d.minX, y: src.minY + d.minY, width: src.width, height: src.height),
                             scale: Double(info.pointPixelScale), window: win)
         }
-        let f = (target.windowID != nil ? win.map { SCContentFilter(desktopIndependentWindow: $0) } : nil) ?? target.filter
+        var f = (target.windowID != nil ? win.map { SCContentFilter(desktopIndependentWindow: $0) } : nil) ?? target.filter
+        if opts.display, !target.appPIDs.isEmpty, let content,
+           let display = content.displays.first(where: { $0.displayID == target.displayID }) {
+            // The apps as they are now: an --also app may have started during setup.
+            var apps = content.applications.filter { target.appPIDs.contains($0.processID) }
+            let extra = try await alsoApps(required: true)
+            apps += extra.apps.filter { m in !apps.contains { $0.processID == m.processID } }
+            if !apps.isEmpty { f = SCContentFilter(display: display, including: apps, exceptingWindows: extra.desktop) }
+        }
         let info = SCShareableContent.info(for: f)
         return Geometry(filter: f, sourceRect: nil, rect: info.contentRect, scale: Double(info.pointPixelScale), window: win)
     }
@@ -746,8 +782,40 @@ public final class Recorder: @unchecked Sendable {
             || owner.applicationName.lowercased() == appName
     }
 
+    /// Running apps matching a name, bundle id or .app path (that exact bundle).
+    private func scApps(_ content: SCShareableContent, matching app: String) -> [SCRunningApplication] {
+        if let path = bundlePath(app) {
+            let pids = Set(NSWorkspace.shared.runningApplications
+                .filter { $0.bundleURL?.resolvingSymlinksInPath().path == path }.map(\.processIdentifier))
+            return content.applications.filter { pids.contains($0.processID) }
+        }
+        let needle = app.lowercased()
+        return content.applications.filter { $0.bundleIdentifier.lowercased() == needle || $0.applicationName.lowercased() == needle }
+    }
+
+    /// The --also apps, and their desktop-level windows (Finder's icons), which stay out
+    /// of the picture. Looked up among all apps, not only those with a window on screen:
+    /// Finder with no window open still counts, and shows up when one opens mid-take.
+    private func alsoApps(required: Bool) async throws -> (apps: [SCRunningApplication], desktop: [SCWindow]) {
+        guard !opts.also.isEmpty else { return ([], []) }
+        let all = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        var apps: [SCRunningApplication] = []
+        for name in opts.also {
+            let more = scApps(all, matching: name)
+            if more.isEmpty && required { throw ReelError.message("--also \(name): no running app by that name, bundle id or path") }
+            apps += more.filter { m in !apps.contains { $0.processID == m.processID } }
+        }
+        let pids = Set(apps.map(\.processID))
+        let desktop = all.windows.filter { $0.windowLayer < 0 && ($0.owningApplication.map { pids.contains($0.processID) } ?? false) }
+        return (apps, desktop)
+    }
+
     struct Target {
         var filter: SCContentFilter; var label: String; var title: String?; var pid: Int32?; var windowID: UInt32?
+        /// Display recordings of an app: the display and the app's processes, so the
+        /// filter can be rebuilt (with --also apps) when capture starts.
+        var displayID: CGDirectDisplayID? = nil
+        var appPIDs: [Int32] = []
         /// The app's window, also for display recordings with --app/--pid (for AX snapshots,
         /// --clean-titlebar, `reel act` and window-relative coordinates).
         var appWindowID: UInt32?
@@ -764,25 +832,24 @@ public final class Recorder: @unchecked Sendable {
                 guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first
                 else { throw ReelError.message("No display found") }
                 if pid != nil || opts.app != nil {
-                    let apps = content.applications.filter { a in
-                        if let pid { return a.processID == pid }
-                        let app = opts.app!.lowercased()
-                        return a.bundleIdentifier.lowercased() == app || a.applicationName.lowercased() == app
-                    }
-                    if !apps.isEmpty {
+                    let main = pid.map { p in content.applications.filter { $0.processID == p } } ?? scApps(content, matching: opts.app!)
+                    if !main.isEmpty {
+                        // --also apps join when capture starts (geometry), once setup is done.
+                        let apps = main
                         // The app's main window: by id/title if given, else its largest.
-                        let ids = Set(apps.map(\.processID))
+                        let ids = Set(main.map(\.processID))
                         var wins = content.windows.filter {
                             $0.windowLayer == 0 && $0.isOnScreen && $0.frame.width > 50 && $0.frame.height > 50
                                 && ($0.owningApplication.map { ids.contains($0.processID) } ?? false)
                         }
                         if let id = opts.windowID { wins = wins.filter { $0.windowID == id } }
                         if let t = opts.windowTitle?.lowercased() { wins = wins.filter { ($0.title ?? "").lowercased().contains(t) } }
-                        let main = wins.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+                        let mainWin = wins.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+                        let name = ([opts.app ?? "pid \(pid!)"] + opts.also).joined(separator: " + ")
                         return Target(filter: SCContentFilter(display: display, including: apps, exceptingWindows: []),
-                                      label: "\(opts.app ?? "pid \(pid!)") on display", title: main?.title,
-                                      pid: pid ?? main?.owningApplication?.processID ?? apps.first?.processID, windowID: nil,
-                                      appWindowID: main?.windowID)
+                                      label: "\(name) on display", title: mainWin?.title,
+                                      pid: pid ?? mainWin?.owningApplication?.processID ?? main.first?.processID, windowID: nil,
+                                      displayID: display.displayID, appPIDs: main.map(\.processID), appWindowID: mainWin?.windowID)
                     }
                 } else {
                     return Target(filter: SCContentFilter(display: display, excludingWindows: []),
@@ -875,11 +942,13 @@ final class MarksFileWatcher: @unchecked Sendable {
     private let queue = DispatchQueue(label: "reel.marks")
     private var timer: DispatchSourceTimer?
     private var consumed = 0
+    private let since: Double
 
-    init(file: URL, state: RecordingState, log: @escaping (String) -> Void) {
-        self.file = file; self.state = state; self.log = log
-        // Only lines written after the recording starts count.
-        consumed = (try? Data(contentsOf: file).count) ?? 0
+    /// The whole file is read, and lines stamped before `since` (when this take began)
+    /// are skipped: a reused file's old lines can't start or stop the new take, while a
+    /// marker the app writes as soon as it launches still counts.
+    init(file: URL, state: RecordingState, since: Double, log: @escaping (String) -> Void) {
+        self.file = file; self.state = state; self.since = since; self.log = log
     }
 
     func start() {
@@ -893,18 +962,23 @@ final class MarksFileWatcher: @unchecked Sendable {
     func stop() { queue.sync { timer?.cancel(); timer = nil; poll() } }
 
     private func poll() {
-        guard let data = try? Data(contentsOf: file), data.count > consumed else { return }
+        guard let data = try? Data(contentsOf: file) else { return }
+        if data.count < consumed { consumed = 0 }   // the file was truncated or replaced
+        guard data.count > consumed else { return }
         let chunk = data[consumed...]
         // Only complete lines; a half-written last line waits for the next poll.
         guard let lastNL = chunk.lastIndex(of: 0x0A) else { return }
         let text = String(decoding: data[consumed...lastNL], as: UTF8.self)
         consumed = lastNL + 1
+        var stale = 0
         for line in text.split(separator: "\n") {
             do {
                 guard let (label, unix) = try MarkLine.parse(String(line)) else { continue }
+                if unix < since { stale += 1; continue }
                 try state.append(.init(label: label, t: ((unix - state.startedAt) * 1000).rounded() / 1000))
             } catch { log("warning: marks file: \(error.localizedDescription)") }
         }
+        if stale > 0 { log("Marks file: ignored \(stale) line\(stale == 1 ? "" : "s") stamped before this take began") }
     }
 }
 
@@ -978,7 +1052,9 @@ final class CursorTracker: @unchecked Sendable {
 
     private func sample() {
         guard let loc = CGEvent(source: nil)?.location else { return }  // global, top-left origin
+        // Either button: a right-click gets a click ring and halo like any other.
         let down = CGEventSource.buttonState(.combinedSessionState, button: .left)
+            || CGEventSource.buttonState(.combinedSessionState, button: .right)
         let r = { (v: Double) in (v * 10000).rounded() / 10000 }
         let t = r(CACurrentMediaTime() - t0)
         samples.append(.init(t: t,
@@ -1018,9 +1094,24 @@ public struct RecordingState: Codable, Sendable {
     static var url: URL { FileManager.default.temporaryDirectory.appendingPathComponent("reel-record.json") }
     var marksURL: URL { FileManager.default.temporaryDirectory.appendingPathComponent("reel-marks-\(pid).jsonl") }
 
+    var failURL: URL { FileManager.default.temporaryDirectory.appendingPathComponent("reel-fail-\(pid).txt") }
+
     func write() throws {
         try? FileManager.default.removeItem(at: marksURL)
+        try? FileManager.default.removeItem(at: failURL)
         try update()
+    }
+
+    /// Asks the running `reel record` to end the take now and report it as failed.
+    public static func failRunning(_ reason: String) throws -> Int32 {
+        let s = try current()
+        try Data((reason.isEmpty ? "failed" : reason).utf8).write(to: s.failURL, options: .atomic)
+        return s.pid
+    }
+
+    func failRequest() -> String? {
+        guard let text = try? String(contentsOf: failURL, encoding: .utf8) else { return nil }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     /// Rewrites the state, keeping markers.
     func update() throws { try JSONEncoder().encode(self).write(to: Self.url, options: .atomic) }
@@ -1074,7 +1165,7 @@ public struct RecordingState: Codable, Sendable {
     }
 
     func collectMarks() -> [RecordingEvents.Marker] {
-        defer { try? FileManager.default.removeItem(at: marksURL) }
+        defer { try? FileManager.default.removeItem(at: marksURL); try? FileManager.default.removeItem(at: failURL) }
         return readMarks()
     }
 }
@@ -1113,7 +1204,8 @@ final class Snapshotter: @unchecked Sendable {
 
     private func snap(t: Double, marker: String?) {
         do {
-            let els = try Accessibility.elements(in: window)
+            // Open menus too, so a drawn script can target a menu item at a marker.
+            let els = try Accessibility.elements(in: window) + Accessibility.menuElements(pid: window.pid, relativeTo: window.frame)
             snapshots.append(.init(t: t, marker: marker, elements: els))
         } catch {
             log("warning: UI snapshot\(marker.map { " at \($0)" } ?? "") failed: \(error.localizedDescription)")

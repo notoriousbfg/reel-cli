@@ -16,6 +16,14 @@ public struct EditPlan: Codable, Sendable {
     public var mute: Bool
     /// Cursor drawn from recorded events (nil = none).
     public var cursor: CursorStyle? = nil
+    /// Keystroke captions on the output timeline.
+    public var captions: [Caption] = []
+
+    public struct Caption: Codable, Sendable, Equatable {
+        public var start: Double
+        public var end: Double
+        public var text: String
+    }
 
     public struct CursorStyle: Codable, Sendable, Equatable {
         /// Size relative to the real macOS cursor.
@@ -194,6 +202,29 @@ public enum Parse {
         }
         return .init(image: path, x: n[0]!, y: n[1]!, width: n.count == 4 ? n[2]! : -1, height: n.count == 4 ? n[3]! : -1,
                      start: start, end: end)
+    }
+
+    /// `TEXT@START` or `TEXT@START..END` (source seconds or marker references).
+    public static func caption(_ s: String) throws -> (text: String, start: String, end: String?) {
+        guard let at = s.lastIndex(of: "@"), at != s.startIndex else {
+            throw ReelError.message("--caption expects TEXT@START or TEXT@START..END, e.g. '⌃⌥Space@1.0' (got \(s))")
+        }
+        let text = String(s[..<at]), time = String(s[s.index(after: at)...]).trimmingCharacters(in: .whitespaces)
+        guard !time.isEmpty else { throw ReelError.message("--caption \(s): missing time after @") }
+        if let r = time.range(of: "..") { return (text, String(time[..<r.lowerBound]), String(time[r.upperBound...])) }
+        return (text, time, nil)
+    }
+
+    /// `window`, `window+12`, `window-8` → the margin in source pixels (nil = not a window crop).
+    public static func windowCrop(_ s: String) throws -> Double? {
+        let v = s.lowercased().trimmingCharacters(in: .whitespaces)
+        guard v.hasPrefix("window") else { return nil }
+        let rest = v.dropFirst(6)
+        if rest.isEmpty { return 0 }
+        guard rest.first == "+" || rest.first == "-", let m = Double(rest) else {
+            throw ReelError.message("--crop \(s): use window, window+12 or window-8 (margin in source pixels)")
+        }
+        return m
     }
 
     /// Optional `N=` prefix used to target a specific clip (1-based) or boundary.

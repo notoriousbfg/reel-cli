@@ -17,6 +17,8 @@ public struct ActOptions: Sendable {
     public var tolerance = 6.0
     /// How long a step waits for a marker its "at" names that hasn't arrived yet.
     public var markerTimeout = 60.0
+    /// How long an element target ({"label": …}) is looked for before the step fails.
+    public var elementTimeout = 1.5
     public init(script: CursorScript) { self.script = script }
 }
 
@@ -32,6 +34,18 @@ public struct ActResult: Codable, Sendable {
     public var markers: [RecordingEvents.Marker]
     public var window: RecordingEvents.Rect
     public var pid: Int32
+    /// What each click and drag actually hit: screen points, and the element when the
+    /// step named one.
+    public var performed: [Performed]?
+
+    public struct Performed: Codable, Sendable {
+        public var step: Int            // 1-based, as in messages
+        public var action: String       // click | right-click | double-click | drag
+        public var x: Double, y: Double // global screen points
+        public var element: String?     // the matched element's label
+        public var role: String?
+        public var inMenu: Bool?        // found in an open menu rather than the window
+    }
 }
 
 public enum Actor {
@@ -106,11 +120,38 @@ public enum Actor {
             }
             return screen(p)
         }
+        // Elements are looked up in the app's open menus first (a menu is modal while it is
+        // open), then in the window, retrying for a moment: menus and sheets take a few
+        // frames to appear after the click that opens them.
+        var lastElement: (element: Accessibility.Element, inMenu: Bool)?
+        var performed: [ActResult.Performed] = []
         let resolver = CursorScript.Resolver(width: capture.width, height: capture.height, scale: 1, element: { ref, _ in
-            let found = Accessibility.find(try Accessibility.elements(in: window), label: ref.label, role: ref.role)
-            guard found.indices.contains(ref.index ?? 0) else { throw ReelError.message("no element \"\(ref.label)\" on screen") }
-            return CursorScript.Resolver.anchor(ref, in: found[ref.index ?? 0].frame)
+            let deadline = Date().addingTimeInterval(o.elementTimeout)
+            while true {
+                let menu = Accessibility.find(Accessibility.menuElements(pid: window.pid, relativeTo: wf), label: ref.label, role: ref.role)
+                let inWindow = Accessibility.find((try? Accessibility.elements(in: window)) ?? [], label: ref.label, role: ref.role)
+                let found = menu + inWindow
+                if found.indices.contains(ref.index ?? 0) {
+                    let e = found[ref.index ?? 0]
+                    lastElement = (e, (ref.index ?? 0) < menu.count)
+                    return CursorScript.Resolver.anchor(ref, in: e.frame)
+                }
+                guard Date() < deadline else {
+                    throw ReelError.message("no element \"\(ref.label)\"\(ref.role.map { " (role \($0))" } ?? "") in the window or an open menu")
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
         })
+        func note(_ i: Int, _ action: String, _ target: CursorScript.Target?) {
+            var p = ActResult.Performed(step: i + 1, action: action, x: (pos.x * 10).rounded() / 10, y: (pos.y * 10).rounded() / 10)
+            if case .element = target, let hit = lastElement {
+                p.element = hit.element.label; p.role = hit.element.role; p.inMenu = hit.inMenu ? true : nil
+            }
+            performed.append(p)
+            log(String(format: "step %d: %@ at (%.0f, %.0f)", i + 1, action, pos.x, pos.y)
+                + (p.element.map { " on \(p.role ?? "element") \"\($0)\"" + (hit(p) ? " (menu)" : "") } ?? ""))
+        }
+        func hit(_ p: ActResult.Performed) -> Bool { p.inMenu == true }
 
         // Watches real input so an abort can say who moved the pointer.
         let watch = InputWatch()
@@ -203,9 +244,13 @@ public enum Actor {
                 try await Task.sleep(for: .milliseconds(min(15, max(1, Int((t - now()) * 1000)))))
             }
         }
-        func post(_ type: CGEventType, at p: CGPoint, clickState: Int64 = 1) {
-            let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: .left)
-            if type == .leftMouseDown || type == .leftMouseUp { e?.setIntegerValueField(.mouseEventClickState, value: clickState) }
+        func post(_ type: CGEventType, at p: CGPoint, clickState: Int64 = 1, flags: CGEventFlags = []) {
+            let right = type == .rightMouseDown || type == .rightMouseUp
+            let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: right ? .right : .left)
+            if [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp].contains(type) {
+                e?.setIntegerValueField(.mouseEventClickState, value: clickState)
+            }
+            if !flags.isEmpty { e?.flags = flags }
             e?.post(tap: .cghidEventTap)
             pos = p
             touched = true
@@ -260,13 +305,24 @@ public enum Actor {
                         try await glide(to: p, from: t - (s.over ?? 0.35), to: t)
                     }
                     try await wait(until: t)
+                    let right = s.button == "right"
+                    let flags = try Keys.flags(s.modifiers ?? [])
                     for k in 1...max(1, s.count ?? 1) {
                         try checkUser()
-                        post(.leftMouseDown, at: pos, clickState: Int64(k)); buttonDown = true
-                        try await Task.sleep(for: .milliseconds(70))
-                        post(.leftMouseUp, at: pos, clickState: Int64(k)); buttonDown = false
+                        if right {
+                            post(.rightMouseDown, at: pos, clickState: Int64(k), flags: flags)
+                            try await Task.sleep(for: .milliseconds(70))
+                            post(.rightMouseUp, at: pos, clickState: Int64(k), flags: flags)
+                        } else {
+                            post(.leftMouseDown, at: pos, clickState: Int64(k), flags: flags); buttonDown = true
+                            try await Task.sleep(for: .milliseconds(70))
+                            post(.leftMouseUp, at: pos, clickState: Int64(k), flags: flags); buttonDown = false
+                        }
                         if k < (s.count ?? 1) { try await Task.sleep(for: .milliseconds(90)) }
                     }
+                    var target: CursorScript.Target?
+                    if case .at(let tg) = c { target = tg }
+                    note(i, right ? "right-click" : (s.count ?? 1) > 1 ? "double-click" : "click", target)
                 }
                 if let d = s.drag {
                     let pts = try d.map { try screenPoint($0, t, "\(label) drag") }
@@ -280,6 +336,7 @@ public enum Actor {
                         try await glide(to: pts[k], from: a, to: a + leg, linear: true)
                     }
                     post(.leftMouseUp, at: pos); buttonDown = false
+                    note(i, "drag", d.last)
                 }
                 if s.down == true { try await wait(until: t); post(.leftMouseDown, at: pos); buttonDown = true }
                 if s.up == true { try await wait(until: t); post(.leftMouseUp, at: pos); buttonDown = false }
@@ -376,7 +433,8 @@ public enum Actor {
         if let aborted { log("Aborted: \(aborted). Released the mouse.") }
         return ActResult(steps: setupSteps.count + steps.count, completed: completed, aborted: aborted, abortCause: abortCause,
                          duration: now() - started,
-                         markers: marks, window: .init(x: wf.minX, y: wf.minY, width: wf.width, height: wf.height), pid: window.pid)
+                         markers: marks, window: .init(x: wf.minX, y: wf.minY, width: wf.width, height: wf.height), pid: window.pid,
+                         performed: performed.isEmpty ? nil : performed)
     }
 }
 
@@ -400,19 +458,34 @@ public enum Keys {
         return m
     }()
 
+    static func modifier(_ name: String) -> CGEventFlags? {
+        switch name.lowercased().trimmingCharacters(in: .whitespaces) {
+        case "cmd", "command": return .maskCommand
+        case "shift": return .maskShift
+        case "opt", "option", "alt": return .maskAlternate
+        case "ctrl", "control": return .maskControl
+        case "fn": return .maskSecondaryFn
+        default: return nil
+        }
+    }
+
+    /// ["option", "shift"] → event flags, for modifier clicks.
+    public static func flags(_ names: [String]) throws -> CGEventFlags {
+        var flags: CGEventFlags = []
+        for n in names {
+            guard let f = modifier(n) else { throw ReelError.message("Unknown modifier \"\(n)\" (cmd, shift, opt, ctrl, fn)") }
+            flags.insert(f)
+        }
+        return flags
+    }
+
     public static func parse(_ combo: String) throws -> (CGKeyCode, CGEventFlags) {
         var flags: CGEventFlags = []
         let parts = combo.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
         guard let keyName = parts.last, !keyName.isEmpty else { throw ReelError.message("Empty key \"\(combo)\"") }
         for m in parts.dropLast() {
-            switch m {
-            case "cmd", "command": flags.insert(.maskCommand)
-            case "shift": flags.insert(.maskShift)
-            case "opt", "option", "alt": flags.insert(.maskAlternate)
-            case "ctrl", "control": flags.insert(.maskControl)
-            case "fn": flags.insert(.maskSecondaryFn)
-            default: throw ReelError.message("Unknown modifier \"\(m)\" in \"\(combo)\" (cmd, shift, opt, ctrl, fn)")
-            }
+            guard let f = modifier(m) else { throw ReelError.message("Unknown modifier \"\(m)\" in \"\(combo)\" (cmd, shift, opt, ctrl, fn)") }
+            flags.insert(f)
         }
         guard let code = codes[keyName] else { throw ReelError.message("Unknown key \"\(keyName)\" in \"\(combo)\"") }
         return (code, flags)

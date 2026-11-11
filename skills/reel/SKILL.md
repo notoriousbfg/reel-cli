@@ -70,7 +70,9 @@ an act script's `"setup"` list. Scenes take `"prepare"`/`"teardown"` commands an
 Popovers, menus and sheets are separate windows: record with `--include-child-windows`
 or they won't appear. For full-screen takes use `--display --app X` (AX snapshots,
 `--clean-titlebar` and `reel act` still work) and `edit --crop window` to get back to the
-window; write scripts with `"coordinates": "window"` so they fit either kind of take.
+window (`window+24` for a margin); write scripts with `"coordinates": "window"` so they
+fit either kind of take. `--display --app X --also Finder` adds another app's windows
+(and nothing else on screen) to the take; let reel launch X so it is in front at t=0.
 
 Record with `--clean-titlebar` so the purple sharing pill never shows in edits. Skip dead
 time by marker: `--cut asked+1..answered-0.3` or `--speed asked+1..answered-0.3=6`; times
@@ -83,7 +85,18 @@ says "The app exited or crashed at Ns" and `endedBy` is `app-exit`.
 
 Markers from a sandboxed app: have it append `<label> <unix time>` lines to a file it can
 write, and pass `--marks-file <file>` to `reel record` (or `reel mark --import <file> --clip raw.mov`
-afterwards).
+afterwards). A driver script adds its own with `reel mark done --marks-file <file>` (or plain
+`reel mark done`). Lines stamped before the take began are ignored, so the file can be reused.
+
+Failed takes: give `record` a `--fail-on failed` marker, or have the driver run
+`reel stop --fail "why"` / `reel act --stop-recording-on-error`. The take ends at once,
+the JSON has `failed`, and the exit code is 5. Don't let a broken take run to `--timeout`.
+
+Two themes or languages of one clip: `"variants": {"light": {}, "dark": {"record": {…}}}`
+in the scene, with `${VARIANT}` in output paths; `reel run scene.json --variant dark`.
+
+A shortcut that can't be pressed on camera: `{"at": 1, "caption": "⌃⌥Space"}` in the
+cursor (or act) script, or `edit --caption '⌃⌥Space@1.0'`, draws it as a caption.
 
 Check the record JSON: `restarts`/`gaps` mean macOS stopped the stream and reel resumed it
 (a frame is held across each gap); exit code 3 means a `--duration` take ended short and
@@ -102,6 +115,11 @@ Optional, needs Accessibility (`reel doctor` shows `accessibility`):
   the take instead of failing the scene. `abortCause` in act's JSON: `person`, `process`,
   `displaced`, `esc`. Act steps can wait on markers the app sends mid-take
   (`"at": "sheet+1.5"`); such scripts run in script order.
+- Context menus: `{"click": true, "button": "right"}`, then
+  `{"click": {"label": "Show in Finder", "role": "menuitem"}}` (labels are searched in open
+  menus too). `"modifiers": ["option"]` holds keys for a click. Act's JSON `performed` says
+  where each click landed and what it matched. Check `reel help formats` for the installed
+  version's formats; its first line names the version.
 
 Batches: put shared styling in `./reel.json` presets (`--preset promo`), or a whole
 take in a scene file and iterate with `reel run scene.json --edit-only --preview check.png`.

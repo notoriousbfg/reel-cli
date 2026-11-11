@@ -540,3 +540,89 @@ import CoreImage
         for (x, y) in zip(a, b) { #expect(abs(x - y) < 0.02) }
     }
 }
+
+@Suite struct TakeControlTests {
+    @Test func rightClicksModifiersAndCaptionsParse() throws {
+        let json = """
+        [{"at": 0.5, "move": [0.5, 0.5], "over": 0},
+         {"at": 1, "click": true, "button": "right"},
+         {"at": 2, "click": [0.2, 0.2], "modifiers": ["option", "shift"]},
+         {"at": 3, "caption": "⌃⌥Space", "over": 2}]
+        """
+        let script = try CursorScript.parse(Data(json.utf8))
+        #expect(script.steps[1].button == "right")
+        #expect(try Keys.flags(script.steps[2].modifiers ?? []) == [.maskAlternate, .maskShift])
+        let ev = try script.events(base: nil, pointsSize: (800, 600), pointPixelScale: 2, duration: 6)
+        // A right-click is drawn like any click; the caption is carried in the events.
+        #expect(ev.clicks.count == 2)
+        #expect(ev.captions == [.init(t: 3, text: "⌃⌥Space", duration: 2)])
+        #expect(throws: (any Error).self) { try CursorScript.parse(Data(#"[{"at": 1, "click": true, "button": "middle"}]"#.utf8)) }
+        #expect(throws: (any Error).self) { try CursorScript.parse(Data(#"[{"at": 1, "click": true, "modifiers": ["hyper"]}]"#.utf8)) }
+        #expect(throws: (any Error).self) { try CursorScript.parse(Data(#"[{"at": 1, "move": [0, 0], "button": "right"}]"#.utf8)) }
+    }
+
+    @Test func captionOnlyScriptNeedsNoCursor() throws {
+        let script = try CursorScript.parse(Data(#"[{"at": 1, "caption": "⌘K"}]"#.utf8))
+        let ev = try script.events(base: nil, pointsSize: (800, 600), pointPixelScale: 2, duration: 3)
+        #expect(ev.captions?.count == 1 && ev.clicks.isEmpty)
+        #expect(ev.samples.allSatisfy { $0.x < 0 })   // parked outside the frame
+    }
+
+    @Test func captionAndWindowCropSpecs() throws {
+        let a = try Parse.caption("⌃⌥Space@1.0")
+        #expect(a.text == "⌃⌥Space" && a.start == "1.0" && a.end == nil)
+        let b = try Parse.caption("me@example@palette-0.2..+2")
+        #expect(b.text == "me@example" && b.start == "palette-0.2" && b.end == "+2")
+        #expect(throws: (any Error).self) { try Parse.caption("no time") }
+        #expect(try Parse.windowCrop("window") == 0)
+        #expect(try Parse.windowCrop("Window+24") == 24)
+        #expect(try Parse.windowCrop("window-8") == -8)
+        #expect(try Parse.windowCrop("0,0,100,100") == nil)
+        #expect(throws: (any Error).self) { try Parse.windowCrop("windowish") }
+    }
+
+    @Test func captionImageRenders() {
+        let img = Composer.captionImage("⌃⌥Space", canvasHeight: 1080)
+        #expect((img?.extent.width ?? 0) > 100 && (img?.extent.height ?? 0) > 40)
+    }
+
+    @Test func variantsMergeObjectsAndReplaceTheRest() {
+        let base: [String: Any] = ["record": ["app": "A.app", "env": ["DEMO": "1"], "args": "-x"], "edit": ["zoom": ["a", "b"], "output": "o.mp4"]]
+        let dark: [String: Any] = ["record": ["env": ["THEME": "dark"], "args": "-theme dark"], "edit": ["zoom": ["c"]]]
+        let m = SceneFile.merge(base, dark)
+        let rec = m["record"] as? [String: Any], edit = m["edit"] as? [String: Any]
+        #expect(rec?["app"] as? String == "A.app")
+        #expect(rec?["env"] as? [String: String] == ["DEMO": "1", "THEME": "dark"])
+        #expect(rec?["args"] as? String == "-theme dark")
+        #expect(edit?["zoom"] as? [String] == ["c"])
+        #expect(edit?["output"] as? String == "o.mp4")
+    }
+
+    /// A reused marks file: lines stamped before the take began are ignored, an early
+    /// line from this take counts, and a truncated file is read again from the top.
+    @Test func marksFileIgnoresOlderTakes() throws {
+        let now = Date().timeIntervalSince1970
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("reel-test-marks-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data("ready \(now - 300)\ndone \(now - 290)\n# previous take above\nready \(now - 0.5)\n".utf8).write(to: file)
+        let state = RecordingState(pid: 2_000_000_000 + Int32.random(in: 0..<1_000_000), output: "/dev/null", startedAt: now)
+        defer { _ = state.collectMarks() }
+        let watcher = MarksFileWatcher(file: file, state: state, since: now - 1, log: { _ in })
+        watcher.start()
+        watcher.stop()
+        #expect(state.readMarks().map(\.label) == ["ready"])
+        #expect(abs((state.readMarks().first?.t ?? 0) + 0.5) < 0.01)
+        try Data("done \(now + 1)\n".utf8).write(to: file)   // shorter than before
+        watcher.stop()
+        #expect(state.readMarks().map(\.label) == ["ready", "done"])
+    }
+
+    @Test func failRequestRoundTrips() throws {
+        let state = RecordingState(pid: 2_000_000_000 + Int32.random(in: 0..<1_000_000), output: "/dev/null", startedAt: 0)
+        #expect(state.failRequest() == nil)
+        try Data("driver failed\n".utf8).write(to: state.failURL)
+        #expect(state.failRequest() == "driver failed")
+        _ = state.collectMarks()
+        #expect(state.failRequest() == nil)
+    }
+}

@@ -30,6 +30,7 @@ public struct EditOptions: Sendable {
     public var cuts: [String] = []          // "A..B" (seconds or markers), optional N=
     public var cutFade = 0.3                // crossfade across each cut (0 = hard cut)
     public var recordedPatches = true       // apply patches stored in the sidecar
+    public var captions: [String] = []      // "TEXT@START[..END]" (source seconds or markers)
     public init() {}
 }
 
@@ -58,21 +59,24 @@ public enum Planner {
             for c in o.crops {
                 let (idx, v) = Parse.indexed(c)
                 guard idx == nil || idx == n + 1 else { continue }
-                if v.lowercased() == "window" {
-                    // The app window's rect from the events (display recordings with --app).
+                if let margin = try Parse.windowCrop(v) {
+                    // The app window's rect from the events (display recordings with --app),
+                    // grown (or shrunk) by the margin and kept inside the frame.
+                    let full = CGRect(x: 0, y: 0, width: size.width, height: size.height)
                     var file = RecordingEvents.sidecarURL(for: url)
                     for e in o.events { let (i, p) = Parse.indexed(e); if i == nil || i == n + 1 { file = URL(fileURLWithPath: p) } }
                     guard let ev = try? RecordingEvents.read(file) else {
                         throw ReelError.message("--crop window needs the events sidecar of \(url.lastPathComponent)")
                     }
+                    var r = full   // no window rect: a window recording, which is already the window
                     if let w = ev.window {
                         let k = Double(size.width) / ev.captureRect.width    // video pixels per point
-                        let r = CGRect(x: (w.x - ev.captureRect.x) * k, y: (w.y - ev.captureRect.y) * k,
-                                       width: w.width * k, height: w.height * k)
-                            .intersection(CGRect(x: 0, y: 0, width: size.width, height: size.height))
-                        guard r.width > 2, r.height > 2 else { throw ReelError.message("--crop window: the window is outside the recording") }
-                        crop = .init(x: r.minX.rounded(), y: r.minY.rounded(), width: r.width.rounded(), height: r.height.rounded())
-                    }   // no window rect: a window recording, which is already the window
+                        r = CGRect(x: (w.x - ev.captureRect.x) * k, y: (w.y - ev.captureRect.y) * k,
+                                   width: w.width * k, height: w.height * k)
+                    }
+                    r = r.insetBy(dx: -margin, dy: -margin).intersection(full)
+                    guard !r.isNull, r.width >= 16, r.height >= 16 else { throw ReelError.message("--crop \(v): the window is outside the recording") }
+                    crop = .init(x: r.minX.rounded(), y: r.minY.rounded(), width: r.width.rounded(), height: r.height.rounded())
                 } else {
                     crop = try Parse.crop(v, sourceWidth: size.width, sourceHeight: size.height)
                 }
@@ -155,6 +159,7 @@ public enum Planner {
         if plan.zooms.contains(where: { $0.target == .cursor }) && !clips.contains(where: \.hasEvents) {
             throw ReelError.message("@cursor zoom needs an .events.json sidecar (recorded by `reel record`)")
         }
+        plan.captions = try captions(o, plan: plan)
         if let scale = o.autoZoom {
             let composer = try Composer(plan: plan)
             let clicks = composer.outputClicks()
@@ -165,6 +170,45 @@ public enum Planner {
     }
 
     public static let maxFitScale = 3.0
+
+    /// Captions from each input's events (cursor-script "caption" steps) and --caption,
+    /// placed on the output timeline. Ones that fall in a cut or outside the trim are dropped.
+    static func captions(_ o: EditOptions, plan: EditPlan) throws -> [EditPlan.Caption] {
+        var out: [EditPlan.Caption] = []
+        func warn(_ s: String) { FileHandle.standardError.write(Data("warning: \(s)\n".utf8)) }
+        func add(_ g: Int, _ a: Double, _ b: Double, _ text: String) {
+            let s = plan.outputTime(input: g, source: a), e = plan.outputTime(input: g, source: b)
+            if e - s < 0.05 { warn(String(format: "caption \"%@\" at %.2fs is outside the trim or inside a cut; skipped", text, a)); return }
+            out.append(.init(start: s, end: e, text: text))
+        }
+        var markers: [[RecordingEvents.Marker]] = []
+        for g in 0..<plan.inputCount {
+            let ev = try plan.clips[plan.firstClip(ofInput: g)!].loadEvents()
+            markers.append(ev?.markers ?? [])
+            for c in ev?.captions ?? [] { add(g, c.t, c.t + (c.duration ?? CursorScript.defaultCaption), c.text) }
+        }
+        for spec in o.captions {
+            let c = try Parse.caption(spec)
+            // Marker names: the first clip that has them (plain seconds: the first clip).
+            var placed = false
+            var lastError: Error?
+            for g in 0..<plan.inputCount {
+                do {
+                    let a = try TimeRef.resolve(c.start, markers: markers[g])
+                    var b = a + CursorScript.defaultCaption
+                    if let end = c.end?.trimmingCharacters(in: .whitespaces) {
+                        // "..+2" = two seconds after the start; otherwise a time or marker.
+                        if end.hasPrefix("+"), let d = Double(end.dropFirst()) { b = a + d }
+                        else { b = try TimeRef.resolve(end, markers: markers[g]) }
+                    }
+                    guard b > a else { throw ReelError.message("end must be after start") }
+                    add(g, a, b, c.text); placed = true; break
+                } catch { lastError = error }
+            }
+            if !placed { throw ReelError.message("--caption \(spec): \(lastError?.localizedDescription ?? "cannot resolve its time")") }
+        }
+        return out.sorted { $0.start < $1.start }
+    }
 
     /// Patches for input clip `n`: from the sidecar (record --clean-titlebar) and --patch.
     static func patches(for clip: EditPlan.Clip, n: Int, _ o: EditOptions) throws -> [RecordingEvents.Patch] {

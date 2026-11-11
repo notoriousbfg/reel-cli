@@ -44,7 +44,9 @@ capture the app's popovers, menus, sheets and drag images where they overlap the
 window; the picture stays the window's frame. To film the whole screen but still know
 the app's window, use `--display --app X`: `--ax-snapshots`, `--clean-titlebar` and
 `reel act` then work, the sidecar stores the window rect, `edit --crop window` crops to
-it, and scripts with `"coordinates": "window"` are window-relative.
+it (`window+24` leaves a margin), and scripts with `"coordinates": "window"` are
+window-relative. Such a take shows only that app's windows; `--also Finder` (repeatable)
+adds another app's, so a take can include a Finder window without the rest of the desktop.
 
 ## Install
 
@@ -114,8 +116,21 @@ moved the pointer: `person` (hardware input), `process` (another app posted inpu
 puts it back once). An act step's `"at"` may name a marker that arrives during the take
 (`"sheet+1.5"`): the step waits for it.
 
+A take can end as failed instead of running to its timeout: `--fail-on failed` (a
+marker), `reel stop --fail "why"` from a driver script, or
+`reel act --stop-recording-on-error`. The file is kept, the JSON says `"failed"`, and
+`reel record` exits 5, so a scene stops before its edit.
+
+Marks files (`--marks-file`) are lines of `<label> <unix time>`; `reel mark done
+--marks-file <file>` appends one. A recording ignores lines stamped before that take
+began, so the same file can be reused from take to take.
+
+A scene with `"variants": {"light": {}, "dark": {"record": {"env": {"THEME": "dark"}}}}`
+runs once per variant, each merged over the scene, with `${VARIANT}` for output paths
+(`reel run scene.json --variant dark` for one).
+
 `reel help formats` documents every JSON file: the events sidecar, cursor
-scripts, presets and scene files.
+scripts, presets, scene files and marks files.
 
 ## Examples
 
@@ -207,6 +222,8 @@ instead of generating thousands of samples:
 ```
 
 Moves ease in and out and arrive at `at`; drags are linear with the button held.
+`{"at": 1, "caption": "⌃⌥Space", "over": 1.6}` draws a keystroke caption at the bottom of
+the frame, for a shortcut the harness performs off camera (or `edit --caption '⌘K@palette'`).
 Coordinates are 0–1, or `"640pt"` / `"1280px"`. `reel cursor raw.mov --script
 moves.json` writes an events file you can inspect; `edit --cursor-script` uses it
 directly.
@@ -226,7 +243,10 @@ Script steps can name elements instead of coordinates:
 `{"at": 2, "click": {"label": "Highlight", "role": "button"}}`. `reel act` finds
 them live; drawing (`--cursor-script`) finds them in the snapshots `--ax-snapshots`
 stored at the start and at each marker. `act` also understands `type`, `key`
-(`"cmd+s"`), `scroll` and `"count": 2`. It takes over the pointer and **aborts the
+(`"cmd+s"`), `scroll`, `"count": 2`, `"button": "right"` and `"modifiers": ["option"]`.
+Labels are looked up in the app's open menus as well as its window, so after a
+right-click, `{"click": {"label": "Show in Finder", "role": "menuitem"}}` picks the
+item. Act's JSON lists where each click landed (`performed`). It takes over the pointer and **aborts the
 moment you move the mouse or press Esc** (exit code 2), releasing any held button.
 
 ### Not supported

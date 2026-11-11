@@ -28,6 +28,15 @@ public struct RecordingEvents: Codable, Sendable {
     public var window: Rect?
     /// Images to draw over the source (record --clean-titlebar), applied by `reel edit`.
     public var patches: [Patch]?
+    /// Keystroke captions (cursor-script "caption" steps), drawn by `reel edit`.
+    public var captions: [Caption]?
+
+    public struct Caption: Codable, Sendable, Equatable {
+        public var t: Double              // source seconds
+        public var text: String
+        public var duration: Double?      // seconds on screen (default 1.6)
+        public init(t: Double, text: String, duration: Double? = nil) { self.t = t; self.text = text; self.duration = duration }
+    }
 
     /// An image drawn over a rectangle of the source video, in source pixels
     /// (top-left origin), for source times start…end (nil = open-ended).

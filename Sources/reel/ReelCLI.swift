@@ -2,6 +2,8 @@ import ArgumentParser
 import Foundation
 import ReelKit
 
+let reelVersion = "0.6.0"
+
 func log(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
 
 func printJSON<T: Encodable>(_ value: T) throws {
@@ -42,7 +44,7 @@ struct Reel: AsyncParsableCommand {
             `locate`, `act` and `record --ax-snapshots` also need Accessibility.
             File formats (events sidecar, cursor scripts, presets, scenes): reel help formats
             """,
-        version: "0.5.4",
+        version: reelVersion,
         subcommands: [Record.self, Shot.self, Stop.self, Mark.self, Windows.self, Edit.self, Run.self, Cursor.self,
                       Changes.self, Info.self, Frame.self, Sheet.self, Locate.self, Act.self, Doctor.self, Formats.self]
     )
@@ -59,6 +61,9 @@ struct Record: AsyncParsableCommand {
             shapes and `reel mark` markers.
             Without --duration, recording runs until Ctrl-C, SIGTERM, `reel stop`,
             --stop-on's marker (+ --tail), or (with --until-exit) the app quitting.
+            A take can also be ended as failed: --fail-on's marker, `reel stop --fail`, or
+            `reel act --stop-recording-on-error`. The file is kept, the JSON has "failed",
+            and the exit code is 5.
             With --start-on, reel launches the app but starts capturing only when that
             marker arrives (t=0); earlier markers get negative times. --timeout bounds
             each marker wait. --duration remains a hard cap.
@@ -73,7 +78,9 @@ struct Record: AsyncParsableCommand {
                    --env DEMO_MODE=1 --args "-AppleLanguages (en)" --until-exit --quit-after -o raw.mov
               reel record --pid 4242 --window-title Chapter -o raw.mov
               reel record --app MyApp --new-instance --start-on ready --stop-on done \\
-                   --tail 1.5 --timeout 60 --quit-after -o raw.mov
+                   --fail-on failed --tail 1.5 --timeout 60 --quit-after -o raw.mov
+              reel record --display --app build/MyApp.app --new-instance --also Finder -o raw.mov
+                   (the whole display, showing only MyApp's and Finder's windows)
             """)
 
     @OptionGroup var target: TargetOptions
@@ -81,6 +88,8 @@ struct Record: AsyncParsableCommand {
     var stopOn: String?
     @Option(help: "Seconds to keep recording after the --stop-on marker.")
     var tail: Double = 0
+    @Option(help: "End the take at once, as failed (exit 5), when this marker arrives.")
+    var failOn: String?
     @Option(help: "Seconds to record.")
     var duration: Double?
     @Flag(help: "Stop when the recorded app quits.")
@@ -112,7 +121,7 @@ struct Record: AsyncParsableCommand {
         var o = try target.options(output: absURL(output))
         o.untilExit = untilExit; o.axSnapshots = axSnapshots
         o.cursorShapes = !noCursorShapes; o.maxRestarts = max(0, maxRestarts)
-        o.stopOn = stopOn; o.tail = max(0, tail); o.cleanTitlebar = cleanTitlebar; o.includeChildWindows = includeChildWindows
+        o.stopOn = stopOn; o.failOn = failOn; o.tail = max(0, tail); o.cleanTitlebar = cleanTitlebar; o.includeChildWindows = includeChildWindows
         o.duration = duration; o.countdown = countdown; o.fps = fps
         o.showsCursor = !noCursor; o.trackCursor = !noEvents; o.hevc = !h264
         if untilExit && target.pid == nil && target.app == nil && target.windowID == nil && target.windowTitle == nil {
@@ -120,6 +129,7 @@ struct Record: AsyncParsableCommand {
         }
         let result = try await Recorder(options: o).run(log: log)
         try printJSON(result)
+        if result.failed != nil { throw ExitCode(5) }
         if result.timedOut != nil { throw ExitCode(4) }
         // A --duration take that ended short is a failure, even though the file is usable.
         let expected = result.endedBy == "stop-marker" || (untilExit && result.endedBy == "app-exit")
@@ -154,6 +164,8 @@ struct TargetOptions: ParsableArguments {
     var windowID: UInt32?
     @Flag(help: "Capture the whole main display (only the app's windows if --app/--pid is given).")
     var display = false
+    @Option(parsing: .singleValue, help: "With --display and --app/--pid: also show this app's windows (name, bundle id or .app path; repeatable), e.g. --also Finder. It must be running when capture starts.")
+    var also: [String] = []
     @Option(help: "Seconds to wait for the app window to appear.")
     var windowTimeout: Double = 15
     @Flag(help: "Quit the app when done (reported only once its process has exited).")
@@ -178,7 +190,7 @@ struct TargetOptions: ParsableArguments {
             o.environment[String(e[..<eq])] = String(e[e.index(after: eq)...])
         }
         if let args { o.arguments = try ShellWords.split(args) }
-        o.windowTitle = windowTitle; o.windowID = windowID; o.display = display
+        o.windowTitle = windowTitle; o.windowID = windowID; o.display = display; o.also = also
         o.windowTimeout = windowTimeout
         return o
     }
@@ -226,8 +238,22 @@ struct Shot: AsyncParsableCommand {
 }
 
 struct Stop: ParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Stop a running `reel record`.")
+    static let configuration = CommandConfiguration(
+        abstract: "Stop a running `reel record`.",
+        discussion: """
+            The recording is finalised as usual. With --fail it ends as a failed take
+            instead: the record JSON has "failed": REASON and `reel record` exits 5, so a
+            driver script that hits an error doesn't leave the take running to its timeout:
+              ./drive-the-app.sh || reel stop --fail "driver failed"
+            """)
+    @Option(help: "End the take as failed, with this reason.")
+    var fail: String?
     func run() throws {
+        if let fail {
+            let pid = try RecordingState.failRunning(fail)
+            log("Asked recording process \(pid) to end the take as failed")
+            return
+        }
         let pid = try RecordingState.stopRunning()
         log("Sent stop to recording process \(pid)")
     }
@@ -248,7 +274,10 @@ struct Mark: ParsableCommand {
             A sandboxed app can't run reel, so let it append "<label> <unix time>" lines
             to a file instead: watch it live with `reel record --marks-file <file>`, or
             import it afterwards with `reel mark --import <file> --clip raw.mov` (times
-            are placed using the sidecar's startedAt).
+            are placed using the sidecar's startedAt). That line format is stable.
+            `reel mark done --marks-file <file>` appends such a line for you, so a driver
+            script and the app can share one file. (Outside a sandbox, plain
+            `reel mark done` reaches the running recording directly.)
             """)
     @Argument(help: "Marker name (letters, digits, - and _ read best in time references).")
     var label: String?
@@ -260,6 +289,8 @@ struct Mark: ParsableCommand {
     var clip: String?
     @Option(help: "With --clip: source time in seconds.")
     var at: Double?
+    @Option(help: "Append \"<label> <unix time>\" to this marks file instead of signalling the recording directly.")
+    var marksFile: String?
 
     func run() throws {
         if let file = `import` {
@@ -291,6 +322,26 @@ struct Mark: ParsableCommand {
         }
         guard let label else { throw ReelError.message("Give a marker name, or --import <file> --clip <recording>") }
         guard !label.isEmpty, Double(label) == nil else { throw ReelError.message("Marker names can't be plain numbers") }
+        if let marksFile {
+            guard clip == nil else { throw ReelError.message("--marks-file writes a live marker; --clip edits a finished recording. Use one.") }
+            let url = absURL(marksFile)
+            let unix = ((Date().timeIntervalSince1970 + offset) * 1000).rounded() / 1000
+            // One write of one whole line, so a watcher never sees half of it.
+            var line = Data()
+            if let existing = try? Data(contentsOf: url), let last = existing.last, last != 0x0A { line.append(0x0A) }
+            line.append(Data("\(label) \(String(format: "%.3f", unix))\n".utf8))
+            if let h = try? FileHandle(forWritingTo: url) {
+                defer { try? h.close() }
+                try h.seekToEnd()
+                try h.write(contentsOf: line)
+            } else {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try line.write(to: url)
+            }
+            struct Written: Encodable { var label: String; var unixTime: Double; var file: String }
+            try printJSON(Written(label: label, unixTime: unix, file: url.path))
+            return
+        }
         if let clip {
             guard let at else { throw ReelError.message("--clip needs --at SECONDS") }
             let url = absURL(clip)
@@ -371,6 +422,9 @@ struct Edit: AsyncParsableCommand {
             Examples:
               --crop 0,56,2400,1500          --crop 10%,10%,80%,80%     --crop 2=0,0,1280,800
               --crop window                  the app window of a `record --display --app` take
+              --crop window+24               …with 24 source px of margin (window-8 trims inward)
+              --caption '⌃⌥Space@1.0'        keystroke caption at source 1.0s (1.6s long)
+              --caption '⌘K@palette-0.2..+2' from a marker, for 2s; or START..END
               --auto-zoom 2                  --transition crossfade:0.8 --transition 2=slide-left:0.5
               --padding 96 --background '#0f2027,#2c5364' --corner-radius 22 --shadow
               --cursor 1.8 --cursor-script moves.json      --preset promo
@@ -382,7 +436,7 @@ struct Edit: AsyncParsableCommand {
     var output: String
     @Option(help: "Named settings from ~/.config/reel/presets.json or ./reel.json (and, under `reel run`, reel.json beside the scene). Flags override it.")
     var preset: String?
-    @Option(parsing: .singleValue, help: "Crop x,y,w,h in source px (or %). Repeatable; N= for one clip.")
+    @Option(parsing: .singleValue, help: "Crop x,y,w,h in source px (or %), or window / window+MARGIN (the app window from the sidecar). Repeatable; N= for one clip.")
     var crop: [String] = []
     @Option(parsing: .singleValue, help: "Zoom; see the forms above. Repeatable. Touching zooms pan between targets.")
     var zoom: [String] = []
@@ -400,6 +454,8 @@ struct Edit: AsyncParsableCommand {
     var cutFade: Double?
     @Option(parsing: .singleValue, help: "Draw IMAGE over a source rectangle: IMAGE@x,y[,w,h][:START-END] (source px and seconds), before crop and zoom. Repeatable; N= for one clip.")
     var patch: [String] = []
+    @Option(parsing: .singleValue, help: "Draw a keystroke caption: TEXT@START, TEXT@START..END or TEXT@START..+SECONDS (source seconds or markers). Repeatable. Cursor-script \"caption\" steps are drawn too.")
+    var caption: [String] = []
     @Flag(help: "Ignore patches stored by `record --clean-titlebar`.")
     var noRecordedPatches = false
     @Option(help: "Output size WxH (default: cropped size of first clip + padding).")
@@ -456,6 +512,7 @@ struct Edit: AsyncParsableCommand {
         o.zooms = zoom; o.autoZoom = autoZoom; o.zoomEase = zoomEase ?? p.zoomEase ?? 0.6
         o.transitions = transition.isEmpty ? (p.transition.map { [$0] } ?? []) : transition
         o.speeds = speed; o.size = size ?? p.size
+        o.captions = caption
         o.cuts = cut; o.cutFade = cutFade ?? 0.3; o.patches = patch; o.recordedPatches = !noRecordedPatches
         o.padding = padding ?? p.padding ?? 0
         o.background = background ?? p.background ?? "#000000"
@@ -590,6 +647,9 @@ struct Run: AsyncParsableCommand {
             "actRetries": 2 redoes the take from prepare if act aborts because the pointer was
             moved (after the mouse has been still for 2s). Esc never retries.
             The edit then draws the recorded pointer; "cursorFrom": "script" draws "cursorScript".
+            "variants": {"light": {…}, "dark": {"record": {"env": {"THEME": "dark"}}}} runs the
+            scene once per variant (or just --variant NAME), each merged over the scene, with
+            ${VARIANT} set: "output": "out/${VARIANT}/clip.mp4".
             Paths are relative to the scene file. Presets come from ~/.config/reel/presets.json,
             then reel.json in the working directory, then reel.json beside the scene file
             (later files win, field by field).
@@ -604,6 +664,8 @@ struct Run: AsyncParsableCommand {
     var preview: String?
     @Option(help: "With --preview: seconds between frames.")
     var every: Double?
+    @Option(parsing: .singleValue, help: "Run only this variant of a scene with \"variants\" (repeatable; default: all, in name order).")
+    var variant: [String] = []
 
     func run() async throws {
         let url = absURL(scene)
@@ -611,6 +673,29 @@ struct Run: AsyncParsableCommand {
         guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ReelError.message("\(url.lastPathComponent) must be a JSON object with \"record\", \"shot\" and/or \"edit\"")
         }
+        guard let variants = json.removeValue(forKey: "variants") else {
+            guard variant.isEmpty else { throw ReelError.message("--variant: \(url.lastPathComponent) has no \"variants\"") }
+            return try await runScene(json, url: url, variant: nil)
+        }
+        guard let variants = variants as? [String: Any], !variants.isEmpty else {
+            throw ReelError.message("\"variants\" is an object of name → scene overrides, e.g. {\"dark\": {\"record\": {\"env\": {\"THEME\": \"dark\"}}}}")
+        }
+        let names = variant.isEmpty ? variants.keys.sorted() : variant
+        if preview != nil && names.count > 1 {
+            throw ReelError.message("--preview writes one file: pick a variant with --variant (\(names.joined(separator: ", ")))")
+        }
+        for name in names {
+            guard let overlay = variants[name] as? [String: Any] else {
+                throw ReelError.message(variants[name] == nil ? "No variant \"\(name)\". Variants: \(variants.keys.sorted().joined(separator: ", "))"
+                                                             : "Variant \"\(name)\" must be an object of scene overrides")
+            }
+            log("══ variant \(name)")
+            try await runScene(SceneFile.merge(json, overlay), url: url, variant: name)
+        }
+    }
+
+    private func runScene(_ scene: [String: Any], url: URL, variant: String?) async throws {
+        var json = scene
         let unknown = Set(json.keys).subtracting(["record", "shot", "edit", "cursorScript", "act", "actCountdown", "actRetries", "cursorFrom", "prepare", "teardown", "name", "notes"])
         if !unknown.isEmpty { throw ReelError.message("Unknown scene keys: \(unknown.sorted().joined(separator: ", "))") }
         if json["shot"] != nil && (json["record"] != nil || json["edit"] != nil) {
@@ -625,6 +710,7 @@ struct Run: AsyncParsableCommand {
         // Variables: built-ins, then whatever prepare exports.
         var vars = SceneVars(builtins: ["SCENE_DIR": sceneDir.path,
                                         "SCENE_NAME": url.deletingPathExtension().lastPathComponent])
+        if let variant { vars.values["VARIANT"] = variant }
         let rawOut = ((json["edit"] as? [String: Any])?["output"] ?? (json["shot"] as? [String: Any])?["output"]
                       ?? (json["record"] as? [String: Any])?["output"]) as? String ?? "recording.mov"
         let out = absURL(try vars.expand(rawOut, strict: false))
@@ -633,7 +719,7 @@ struct Run: AsyncParsableCommand {
 
         let doTake = !editOnly
         // prepare's values from the last full run, so --edit-only can resolve them.
-        let cache = sceneDir.appendingPathComponent(".\(url.deletingPathExtension().lastPathComponent).vars.json")
+        let cache = sceneDir.appendingPathComponent(".\(url.deletingPathExtension().lastPathComponent)\(variant.map { "." + $0 } ?? "").vars.json")
         if !doTake {
             if let data = try? Data(contentsOf: cache), let saved = try? JSONDecoder().decode([String: String].self, from: data) {
                 for (k, v) in saved where vars.values[k] == nil { vars.values[k] = v }
@@ -749,6 +835,17 @@ struct Run: AsyncParsableCommand {
         }
         // When act drove the real pointer, draw what was recorded so drawn and real can't drift.
         let drawScript = json["act"] == nil || (json["cursorFrom"] as? String) == "script"
+        if !drawScript, let act = json["act"] {
+            // The recorded pointer has no captions of its own: draw the act script's.
+            var captions = (edit["caption"] as? [Any]) ?? (edit["caption"].map { [$0] } ?? [])
+            for s in try Self.actScript(act).steps {
+                guard let text = s.caption else { continue }
+                let at: String
+                switch s.at { case .seconds(let v): at = "\(v)"; case .ref(let r): at = r }
+                captions.append("\(text)@\(at)" + (s.over.map { "..+\($0)" } ?? ""))
+            }
+            if !captions.isEmpty { edit["caption"] = captions }
+        }
         if json["cursorScript"] != nil && !drawScript {
             log("Note: drawing the recorded pointer (act drove it); set \"cursorFrom\": \"script\" to draw the cursor script instead")
         }
@@ -772,15 +869,18 @@ struct Run: AsyncParsableCommand {
 }
 
 extension Run {
+    static func actScript(_ act: Any) throws -> CursorScript {
+        if let path = act as? String { return try CursorScript.load(absURL(path)) }
+        if JSONSerialization.isValidJSONObject(act) { return try CursorScript.parse(try JSONSerialization.data(withJSONObject: act), name: "scene act") }
+        throw ReelError.message("\"act\" is a script file or an inline script")
+    }
+
     /// Records while performing the scene's "act" script with real input. Act starts once
     /// the recording is armed (so its setup steps and start marker work), and stops the
     /// recording when it ends if the record block has no stop condition of its own.
     func recordWithAct(_ cmd: inout Record, rec: [String: Any], act: Any) async throws {
         try Accessibility.require("A scene \"act\"")
-        let script: CursorScript
-        if let path = act as? String { script = try CursorScript.load(absURL(path)) }
-        else if JSONSerialization.isValidJSONObject(act) { script = try CursorScript.parse(try JSONSerialization.data(withJSONObject: act), name: "scene act") }
-        else { throw ReelError.message("\"act\" is a script file or an inline script") }
+        let script = try Self.actScript(act)
         let hasStop = rec["duration"] != nil || rec["stopOn"] != nil || (rec["untilExit"] as? Bool) == true
         let tail = (rec["tail"] as? NSNumber)?.doubleValue ?? 1.0
         let recordDone = SharedBool()
@@ -856,7 +956,7 @@ struct SceneVars {
             let name = String(rest[open.upperBound..<close])
             if let v = values[name] ?? ProcessInfo.processInfo.environment[name] { out += v }
             else if strict {
-                throw ReelError.message("Unknown ${\(name)} in the scene. Built-ins: SCENE_DIR, SCENE_NAME, OUT, OUT_DIR; "
+                throw ReelError.message("Unknown ${\(name)} in the scene. Built-ins: SCENE_DIR, SCENE_NAME, OUT, OUT_DIR (and VARIANT in a scene with variants); "
                                         + "prepare commands can define more by printing \(name)=value" + (hint.map { ". " + $0 } ?? ""))
             } else { out += "${\(name)}" }
             rest = rest[rest.index(after: close)...]
@@ -996,7 +1096,15 @@ struct Frame: AsyncParsableCommand {
 
 struct Sheet: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Save a contact sheet of timestamped thumbnails (clicks circled in red).")
+        abstract: "Save a contact sheet of timestamped thumbnails (clicks circled in red).",
+        discussion: """
+            Works on any video: a raw recording straight from `reel record` (clicks come
+            from its .events.json sidecar; times are source seconds, the ones cursor
+            scripts, markers and src: zooms use) or an exported edit. For a sheet of an
+            edit without exporting it, use `reel edit … --preview-sheet`.
+              reel sheet raw.mov --every 1 --grid -o sheet.png
+              reel sheet raw.mov --at 5.5,25.3 --crop 50%,0,50%,40% -o detail.png
+            """)
     @Argument var file: String
     @Option(help: "Seconds between frames.") var every: Double?
     @Option(help: "Number of frames (default 12).") var count: Int?
@@ -1032,6 +1140,8 @@ struct Sheet: AsyncParsableCommand {
 
 struct Formats: ParsableCommand {
     static let text = """
+        reel \(reelVersion) file formats (this text ships with the binary: `reel --version` matches)
+
         EVENTS SIDECAR  (<clip>.events.json, written by `reel record`, `reel cursor`)
           {
             "version": 1,
@@ -1040,12 +1150,14 @@ struct Formats: ParsableCommand {
             "pointPixelScale": 2,                       // video pixels per point
             "samples": [{"t": 0.008, "x": 0.41, "y": 0.22, "down": false}, …],
                 // ~120/s. t = source seconds; x/y = 0–1 of the frame, top-left origin;
-                // outside 0–1 = pointer not over the capture. down = left button held.
+                // outside 0–1 = pointer not over the capture. down = a mouse button held.
             "shapes": [{"t": 3.2, "shape": "ibeam"}],   // arrow|ibeam|hand|crosshair (arrow before first)
             "markers": [{"label": "open-palette", "t": 4.1}],   // reel mark, --marks-file, mark --import
+            "captions": [{"t": 1.0, "text": "⌃⌥Space", "duration": 1.6}],   // cursor-script "caption" steps
             "snapshots": [{"t": 4.1, "marker": "open-palette", "elements": [
                 {"role": "AXButton", "label": "Highlight", "frame": {…}, "center": [x, y], …}]}],
                 // record --ax-snapshots: at t=0 and each marker; frames are 0–1 of the window
+                // (items of a menu open at that moment are included, and may lie outside 0–1)
             "patches": [{"image": "raw.titlebar.png", "x": 0, "y": 0, "width": 180, "height": 80,
                          "start": 2.01, "end": null, "feather": 16, "matchTone": true}],
                 // record --clean-titlebar: drawn over the source (px) by `reel edit`, before crop
@@ -1073,6 +1185,12 @@ struct Formats: ParsableCommand {
             {"at": 5, "click": {"label": "Highlight", "role": "button", "anchor": [0.5, 0.5]}}
                 element target: from record --ax-snapshots (drawing) or found live (reel act)
             {"at": 6, "click": true, "count": 2}             double-click
+            {"at": 6, "click": true, "button": "right"}      right-click (drawn like a click)
+            {"at": 6, "click": [0.4, 0.3], "modifiers": ["option"]}
+                                                             cmd | shift | option | ctrl | fn, held for the click (reel act)
+            {"at": 1, "caption": "⌃⌥Space", "over": 1.6}     drawn only: a keystroke caption at the bottom of the
+                                                             frame for "over" seconds, e.g. for a shortcut the
+                                                             harness performs. Also: edit --caption 'TEXT@START'
           reel act only (ignored when drawing):
             {"at": 7, "type": "Hello"}  {"at": 8, "key": "cmd+s"}  {"at": 9, "scroll": [0, 400]}
             {"setup": [steps…], "steps": [steps…]}   setup runs first on act's own clock, before
@@ -1084,6 +1202,9 @@ struct Formats: ParsableCommand {
             drawn or performed. Element targets are always found in the app window.
           reel act: an "at" may name a marker that hasn't been sent yet ("sheet+1.5"); the step
             waits for it (up to 60s). Steps then run in script order.
+          reel act: {"label": …} targets are looked for in the app's open menus first (context
+            menus, pop-ups, menu-bar menus: {"label": "Show in Finder", "role": "menuitem"}),
+            then in its window, retrying for up to 1.5s while a menu or sheet appears.
           reel act without --now follows the recording's clock; if the recording is waiting
             on --start-on, act waits for capture to start.
           Defaults: move "over" 0.6s, drag "over" 0.8s.
@@ -1103,17 +1224,26 @@ struct Formats: ParsableCommand {
                       "startOn": "ready", "stopOn": "done", "tail": 1.5, "timeout": 60},
            "cursorScript": "moves.json" | [steps…],
            "act": "act.json" | {"steps": […]},   // performed with real input while recording
+                                                  // (its "caption" steps are drawn by the edit)
            "cursorFrom": "script",                // with "act": draw cursorScript, not the recorded pointer
            "actCountdown": 3, "actRetries": 2,    // with "act": hands-off banner; redo aborted takes
            "edit": {"trim": "1.2-22" | [1.2, 22], "input": "raw.mov", <reel edit flags>,
                     "cut": ["asked+1..answered-0.3"], "speed": ["a..b=6"], "patch": ["img.png@0,0"]},
-           "teardown": ["shell command", …]}     // always runs, after quitAfter
+           "teardown": ["shell command", …],     // always runs, after quitAfter
+           "variants": {"light": {}, "dark": {"record": {"env": {"THEME": "dark"}, "args": "-theme dark"}}}}
           or, for a still: {"prepare": …, "shot": {<reel shot flags>}, "teardown": …}
           Commands run with sh in the scene's folder. stdout lines KEY=VALUE from prepare
           become ${KEY} in any later string (and $KEY in later commands); other output is
           shown. Built-ins: ${SCENE_DIR}, ${SCENE_NAME} (file name without .json), ${OUT}
           (the final output: edit, shot or record "output"), ${OUT_DIR}. Unknown names fall
           back to the environment, else the scene fails (teardown still runs).
+          Display takes: "record": {"display": true, "app": "build/MyApp.app", "also": ["Finder"]}
+          shows only those apps' windows; "edit": {"crop": "window+24"} crops back to the app's
+          window. "failOn": "failed" ends the take as failed (exit 5, no edit) on that marker.
+          "variants": the scene runs once per variant, in name order (`--variant NAME` for one).
+          Each variant's object is merged over the scene: objects merge key by key, anything
+          else (strings, numbers, lists) replaces. ${VARIANT} is the variant's name; use it in
+          outputs ("out/${VARIANT}/clip.mp4") so variants don't overwrite each other.
           `reel run scene.json --edit-only` redoes the edit (no prepare/teardown); it expands
           only the edit, cursor script and record "output", using prepare's values saved by
           the last full run in .<scene>.vars.json beside the scene;
@@ -1124,7 +1254,17 @@ struct Formats: ParsableCommand {
           marker (about 0.15s after it). Markers sent while waiting are kept with negative
           times (the start marker itself included); references to them still work, and
           zooms clamp to 0. Exit codes: 1 start marker timed out (nothing recorded),
-          3 a --duration take ended short, 4 the stop marker timed out (file kept).
+          3 a --duration take ended short, 4 the stop marker timed out (file kept),
+          5 the take was ended as failed (--fail-on, `reel stop --fail`,
+          `reel act --stop-recording-on-error`; file kept, JSON "failed" says why).
+
+        MARKS FILE  (record/shot --marks-file, mark --import, mark --marks-file)   stable format
+          One marker per line: "<label> <unix time in seconds>", e.g. "done 1762859012.250".
+          Blank lines and lines starting with # are skipped. Append whole lines.
+          `reel mark done --marks-file <file>` appends one for you. A watching recording
+          reads the whole file and ignores lines stamped before that take began, so the
+          file can be reused between takes without clearing it, and a marker the app
+          writes the moment it launches still counts.
         """
     static let configuration = CommandConfiguration(
         abstract: "Describe reel's JSON files: events sidecar, cursor scripts, presets, scenes.",

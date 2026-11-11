@@ -42,6 +42,9 @@ public struct CursorScript: Sendable {
         public var click: ClickValue?
         public var drag: [Target]?
         public var count: Int?          // click count (2 = double-click)
+        public var button: String?      // click: "left" (default) or "right"
+        public var modifiers: [String]? // click: keys held, e.g. ["option"] (performed by reel act)
+        public var caption: String?     // drawn only: a keystroke caption, shown for "over" seconds
         public var type: String?        // reel act: text to type
         public var key: String?         // reel act: e.g. "cmd+s", "return"
         public var scroll: [Double]?    // reel act: [dx, dy] in points (positive dy scrolls down)
@@ -200,15 +203,35 @@ public struct CursorScript: Sendable {
     public static func parse(_ data: Data, name: String = "cursor script") throws -> CursorScript {
         struct Wrapped: Decodable { var steps: [Step]?; var setup: [Step]?; var coordinates: String? }
         do {
-            if let steps = try? JSONDecoder().decode([Step].self, from: data) { return .init(steps: steps) }
+            if let steps = try? JSONDecoder().decode([Step].self, from: data) {
+                try validate(steps, name: name)
+                return .init(steps: steps)
+            }
             let w = try JSONDecoder().decode(Wrapped.self, from: data)
             guard w.steps != nil || w.setup != nil else { throw ReelError.message("\(name): expected an array of steps or {\"steps\": [...]}") }
             if let c = w.coordinates, c != "window", c != "capture" {
                 throw ReelError.message("\(name): \"coordinates\" is \"window\" or \"capture\" (got \"\(c)\")")
             }
+            try validate(w.steps ?? [], name: name)
+            try validate(w.setup ?? [], name: name + " setup")
             return .init(steps: w.steps ?? [], setup: w.setup, coordinates: w.coordinates)
         } catch let e as DecodingError {
             throw ReelError.message("\(name): \(Self.describe(e))")
+        }
+    }
+
+    static func validate(_ steps: [Step], name: String) throws {
+        for (i, s) in steps.enumerated() {
+            let at = "\(name) step \(i + 1)"
+            if let b = s.button {
+                guard b == "left" || b == "right" else { throw ReelError.message("\(at): \"button\" is \"left\" or \"right\" (got \"\(b)\")") }
+                guard s.click != nil else { throw ReelError.message("\(at): \"button\" goes with \"click\"") }
+            }
+            if let m = s.modifiers {
+                guard s.click != nil else { throw ReelError.message("\(at): \"modifiers\" goes with \"click\"") }
+                do { _ = try Keys.flags(m) } catch { throw ReelError.message("\(at): \(error.localizedDescription)") }
+            }
+            if let c = s.caption, c.isEmpty { throw ReelError.message("\(at): \"caption\" is empty") }
         }
     }
 
@@ -222,6 +245,7 @@ public struct CursorScript: Sendable {
         }
     }
 
+    public static let defaultCaption = 1.6
     public static let clickHold = 0.09
     public static let defaultMove = 0.6
     public static let sampleRate = 120.0
@@ -262,6 +286,7 @@ public struct CursorScript: Sendable {
         var downs: [(Double, Double)] = []      // pressed intervals
         var shapes: [RecordingEvents.ShapeChange] = []
         var visibility: [(Double, Bool)] = []
+        var captions: [RecordingEvents.Caption] = []
         var pos: (Double, Double)? = nil
         var posT = 0.0
         var openDown: Double? = nil
@@ -310,11 +335,12 @@ public struct CursorScript: Sendable {
             if s.down == true { openDown = t }
             if s.up == true, let d0 = openDown { downs.append((d0, t)); openDown = nil }
             if let sh = s.shape { shapes.append(.init(t: t, shape: sh)) }
+            if let text = s.caption { captions.append(.init(t: t, text: text, duration: s.over ?? Self.defaultCaption)) }
             if s.hide == true { visibility.append((t, false)) }
             if s.show == true { visibility.append((t, true)) }
         }
         if let d0 = openDown { downs.append((d0, .infinity)) }
-        guard let firstPos = segments.first?.a ?? pos else {
+        guard let firstPos = segments.first?.a ?? pos ?? (captions.isEmpty ? nil : (-1, -1)) else {
             throw ReelError.message("Cursor script never places the cursor: add a step with \"move\": [x, y]")
         }
 
@@ -357,6 +383,7 @@ public struct CursorScript: Sendable {
         ev.startedAt = base?.startedAt
         ev.markers = markers.isEmpty ? nil : markers
         ev.shapes = shapes.isEmpty ? nil : shapes.sorted { $0.t < $1.t }
+        ev.captions = captions.isEmpty ? nil : captions.sorted { $0.t < $1.t }
         ev.synthetic = true
         ev.window = base?.window
         return ev

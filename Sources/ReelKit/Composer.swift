@@ -1,4 +1,5 @@
 import CoreImage
+import CoreText
 import Foundation
 
 /// Turns an `EditPlan` into a frame for any output time. This is the single
@@ -14,6 +15,7 @@ public final class Composer: @unchecked Sendable {
     let cursorSprites: [CursorSprite?]
     let clipClicks: [[RecordingEvents.Click]]
     let patchImages: [String: CIImage]
+    let captionImages: [String: CIImage]
 
     public init(plan: EditPlan) throws {
         self.plan = plan
@@ -56,6 +58,60 @@ public final class Composer: @unchecked Sendable {
             imgs[p.image] = img
         }
         patchImages = imgs
+        var caps: [String: CIImage] = [:]
+        for c in plan.captions where caps[c.text] == nil { caps[c.text] = Self.captionImage(c.text, canvasHeight: H) }
+        captionImages = caps
+    }
+
+    /// A keystroke caption: white text on a dark rounded pill, sized to the canvas.
+    static func captionImage(_ text: String, canvasHeight H: Double) -> CIImage? {
+        let size = max(18, (H * 0.036).rounded())
+        let font = CTFontCreateUIFontForLanguage(.emphasizedSystem, size, nil) ?? CTFontCreateWithName("Helvetica-Bold" as CFString, size, nil)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .init(kCTFontAttributeName as String): font,
+            .init(kCTForegroundColorAttributeName as String): CGColor(gray: 1, alpha: 1),
+            .init(kCTKernAttributeName as String): size * 0.03,
+        ]
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attrs))
+        var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
+        let textWidth = CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
+        let padX = size * 0.75, padY = size * 0.42
+        let w = Int((textWidth + padX * 2).rounded(.up)), h = Int((ascent + descent + padY * 2).rounded(.up))
+        guard w > 0, h > 0, let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                                 space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let box = CGRect(x: 0, y: 0, width: w, height: h)
+        let radius = Double(h) * 0.3
+        ctx.addPath(CGPath(roundedRect: box, cornerWidth: radius, cornerHeight: radius, transform: nil))
+        // Core Image blends in linear light, where a dark fill over a pale window reads
+        // much lighter than its alpha suggests; hence nearly opaque.
+        ctx.setFillColor(CGColor(gray: 0.05, alpha: 0.94))
+        ctx.fillPath()
+        ctx.addPath(CGPath(roundedRect: box.insetBy(dx: 1, dy: 1), cornerWidth: radius - 1, cornerHeight: radius - 1, transform: nil))
+        ctx.setStrokeColor(CGColor(gray: 1, alpha: 0.16))
+        ctx.setLineWidth(max(1, size / 24))
+        ctx.strokePath()
+        ctx.textPosition = CGPoint(x: padX, y: padY + descent)
+        CTLineDraw(line, ctx)
+        return ctx.makeImage().map { CIImage(cgImage: $0) }
+    }
+
+    /// Captions showing at output time `t`, bottom centre of the content, over the zoom.
+    func drawCaptions(at t: Double, over frame: CIImage) -> CIImage {
+        var out = frame
+        let pad = plan.canvas.padding
+        // One at a time: a caption that starts while another is showing replaces it.
+        if let c = plan.captions.last(where: { t >= $0.start && t < $0.end }) {
+            guard let img = captionImages[c.text] else { return out }
+            let alpha = max(0, min(1, (t - c.start) / 0.15, (c.end - t) / 0.25))
+            let x = (W - img.extent.width) / 2, y = pad + (H - 2 * pad) * 0.06
+            var placed = img.transformed(by: CGAffineTransform(translationX: x, y: y))
+            if alpha < 0.999 {
+                placed = placed.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: alpha)])
+            }
+            out = placed.composited(over: out)
+        }
+        return out
     }
 
     /// `still` shifted to the tone `frame` has in the strip at the still's right edge,
@@ -329,6 +385,8 @@ public final class Composer: @unchecked Sendable {
             frame = frame.cropped(to: CGRect(x: ox, y: oy, width: vw, height: vh))
                 .transformed(by: CGAffineTransform(translationX: -ox, y: -oy).concatenating(.init(scaleX: z.scale, y: z.scale)))
         }
+
+        if !plan.captions.isEmpty { frame = drawCaptions(at: t, over: frame) }
 
         var brightness = 1.0
         if plan.fadeIn > 0 { brightness = min(brightness, t / plan.fadeIn) }

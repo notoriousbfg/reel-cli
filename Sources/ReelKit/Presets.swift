@@ -86,3 +86,17 @@ public enum Presets {
         return p
     }
 }
+
+/// Scene-file helpers shared with the CLI.
+public enum SceneFile {
+    /// `overlay` merged into `base`: objects merge key by key (recursively); anything
+    /// else (strings, numbers, lists) replaces. Used for scene "variants".
+    public static func merge(_ base: [String: Any], _ overlay: [String: Any]) -> [String: Any] {
+        var out = base
+        for (k, v) in overlay {
+            if let a = out[k] as? [String: Any], let b = v as? [String: Any] { out[k] = merge(a, b) }
+            else { out[k] = v }
+        }
+        return out
+    }
+}

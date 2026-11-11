@@ -63,6 +63,12 @@ struct Act: AsyncParsableCommand {
               {"at": 3, "type": "Hello"}   {"at": 5, "key": "cmd+s"}   {"at": 6, "scroll": [0, 400]}
               {"at": 2, "click": {"label": "Highlight", "role": "button"}}   (found live on screen)
               {"at": 2, "click": true, "count": 2}                          (double-click)
+              {"at": 2, "click": true, "button": "right"}                   (context menu)
+              {"at": 3, "click": {"label": "Show in Finder", "role": "menuitem"}}
+              {"at": 2, "click": [0.4, 0.3], "modifiers": ["option"]}
+            Element targets are looked for in the app's open menus and its window, for up
+            to 1.5s. The JSON's "performed" lists where each click landed (screen points)
+            and which element it matched.
             With `reel record` running, times are on the recording's clock and the recorded
             window is the target, so one script can be performed for real or only drawn.
             It takes over the pointer and aborts as soon as you move the mouse or press Esc.
@@ -70,6 +76,9 @@ struct Act: AsyncParsableCommand {
               reel record --app MyApp --launch -o raw.mov &
               reel act --script demo.json
               reel stop
+            With --stop-recording-on-error, a script that fails or is aborted ends the
+            running recording as a failed take (exit 5 from `reel record`) instead of
+            leaving it to run to its timeout.
             """)
     @Option(help: "Cursor script JSON.") var script: String
     @Option(help: "Target process (default: the running recording's).") var pid: Int32?
@@ -77,12 +86,26 @@ struct Act: AsyncParsableCommand {
     @Flag(help: "Start the script clock now rather than at the recording's t=0.") var now = false
     @Option(help: "Typing speed, characters per second.") var typeRate: Double = 14
     @Option(help: "Abort if the pointer is this many points from where reel put it.") var tolerance: Double = 6
+    @Flag(help: "If the script fails or is aborted, end the running recording as a failed take.") var stopRecordingOnError = false
 
     func run() async throws {
-        var o = ActOptions(script: try CursorScript.load(absURL(script)))
-        o.pid = pid; o.windowID = windowID; o.now = now; o.typeRate = typeRate; o.tolerance = tolerance
-        let r = try await Actor.perform(o, log: log)
+        func failTake(_ reason: String) {
+            guard stopRecordingOnError, (try? RecordingState.failRunning("reel act: " + reason)) != nil else { return }
+            log("Ended the recording as a failed take")
+        }
+        let r: ActResult
+        do {
+            var o = ActOptions(script: try CursorScript.load(absURL(script)))
+            o.pid = pid; o.windowID = windowID; o.now = now; o.typeRate = typeRate; o.tolerance = tolerance
+            r = try await Actor.perform(o, log: log)
+        } catch {
+            failTake(error.localizedDescription)
+            throw error
+        }
         try printJSON(r)
-        if r.aborted != nil { throw ExitCode(2) }
+        if let reason = r.aborted {
+            failTake("aborted: " + reason)
+            throw ExitCode(2)
+        }
     }
 }

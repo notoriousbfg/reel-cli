@@ -138,6 +138,62 @@ public enum Accessibility {
         return out
     }
 
+    /// Items of the app's open menus (context menus, pop-ups, menu-bar menus and their
+    /// submenus). A menu is a separate window, not a child of the app's window, so each
+    /// of the app's on-screen windows above the normal level is hit-tested for an AXMenu.
+    /// Frames are normalized to `wr` (the app window) and may lie outside 0–1.
+    public static func menuElements(pid: Int32, relativeTo wr: CGRect) -> [Element] {
+        guard AXIsProcessTrusted(), wr.width > 0, wr.height > 0,
+              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return [] }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 1.0)
+        func role(_ e: AXUIElement) -> String { attr(e, kAXRoleAttribute) ?? "" }
+        func menu(above e: AXUIElement) -> AXUIElement? {
+            var cur = e
+            for _ in 0..<8 {
+                if role(cur) == "AXMenu" { return cur }
+                guard let p: AXUIElement = attr(cur, kAXParentAttribute) else { return nil }
+                cur = p
+            }
+            return nil
+        }
+        var menus: [AXUIElement] = []
+        func add(_ e: AXUIElement?) {
+            guard let e, let m = menu(above: e), !menus.contains(where: { CFEqual($0, m) }) else { return }
+            menus.append(m)
+        }
+        for w in list {
+            guard let owner = w[kCGWindowOwnerPID as String] as? Int32, owner == pid,
+                  let layer = w[kCGWindowLayer as String] as? Int, layer > 0,
+                  let b = w[kCGWindowBounds as String] as? [String: Double],
+                  let width = b["Width"], let height = b["Height"], width > 8, height > 8 else { continue }
+            var hit: AXUIElement?
+            if AXUIElementCopyElementAtPosition(app, Float((b["X"] ?? 0) + width / 2), Float((b["Y"] ?? 0) + height / 2), &hit) == .success { add(hit) }
+        }
+        // While a menu is tracking, the focused element is the menu or one of its items.
+        let focused: AXUIElement? = attr(app, kAXFocusedUIElementAttribute)
+        add(focused)
+        var out: [Element] = []
+        for m in menus {
+            let items: [AXUIElement] = attr(m, kAXChildrenAttribute) ?? []
+            for e in items {
+                guard let f = frame(e), f.width > 0, f.height > 0 else { continue }
+                let title: String? = attr(e, kAXTitleAttribute)
+                let desc: String? = attr(e, kAXDescriptionAttribute)
+                let ident: String? = attr(e, kAXIdentifierAttribute)
+                guard let label = [title, desc, ident].compactMap({ $0 }).first(where: { !$0.isEmpty }) else { continue }
+                let n = RecordingEvents.Rect(x: r4((f.minX - wr.minX) / wr.width), y: r4((f.minY - wr.minY) / wr.height),
+                                             width: r4(f.width / wr.width), height: r4(f.height / wr.height))
+                out.append(Element(role: role(e), subrole: attr(e, kAXSubroleAttribute), label: label,
+                                   title: nonEmpty(title), description: nonEmpty(desc), value: nil, identifier: nonEmpty(ident),
+                                   frame: n, center: [r4(n.x + n.width / 2), r4(n.y + n.height / 2)],
+                                   screenFrame: .init(x: f.minX, y: f.minY, width: f.width, height: f.height),
+                                   enabled: attr(e, kAXEnabledAttribute)))
+            }
+        }
+        return out
+    }
+
     static func r4(_ v: Double) -> Double { (v * 10000).rounded() / 10000 }
     static func nonEmpty(_ s: String?) -> String? { (s?.isEmpty ?? true) ? nil : s }
 
