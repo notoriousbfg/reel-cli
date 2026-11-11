@@ -29,7 +29,7 @@ struct Reel: AsyncParsableCommand {
         abstract: "Record and edit polished screen recordings from the command line.",
         discussion: """
             Typical agent loop:
-              reel record --app Grasmere --launch --no-cursor --duration 20 -o raw.mov
+              reel record --app MyApp --launch --no-cursor --duration 20 -o raw.mov
               reel sheet raw.mov -o sheet.png --grid        # look at the footage
               reel changes raw.mov                          # when does the screen change?
               reel edit raw.mov:1.5-18 --cursor 1.8 --zoom src:4-8:rect=0.5,0.1,0.4,0.3 \\
@@ -68,11 +68,11 @@ struct Record: AsyncParsableCommand {
             When reel launches the app, it records that process's first window.
 
             Examples:
-              reel record --app Grasmere --launch --duration 20 -o raw.mov
-              reel record --app ~/build/Debug/Grasmere.app --new-instance \\
+              reel record --app MyApp --launch --duration 20 -o raw.mov
+              reel record --app ~/build/Debug/MyApp.app --new-instance \\
                    --env DEMO_MODE=1 --args "-AppleLanguages (en)" --until-exit --quit-after -o raw.mov
               reel record --pid 4242 --window-title Chapter -o raw.mov
-              reel record --app Grasmere --new-instance --start-on ready --stop-on done \\
+              reel record --app MyApp --new-instance --start-on ready --stop-on done \\
                    --tail 1.5 --timeout 60 --quit-after -o raw.mov
             """)
 
@@ -132,7 +132,7 @@ struct Record: AsyncParsableCommand {
 
 /// Launch and target flags shared by `record` and `shot`.
 struct TargetOptions: ParsableArguments {
-    @Option(help: "App to capture: name (Grasmere), bundle id (com.example.Grasmere) or .app path (that exact bundle).")
+    @Option(help: "App to capture: name (MyApp), bundle id (com.example.MyApp) or .app path (that exact bundle).")
     var app: String?
     @Option(help: "Capture a window of this running process instead of looking the app up.")
     var pid: Int32?
@@ -193,7 +193,7 @@ struct Shot: AsyncParsableCommand {
             Launches like `reel record`, optionally waits for a marker and --settle seconds,
             captures the window, then quits the app if reel launched it (--keep-open to leave it).
 
-              reel shot --app build/Grasmere.app --new-instance --env DEMO=1 \
+              reel shot --app build/MyApp.app --new-instance --env DEMO=1 \
                    --start-on ready --settle 0.5 --width 1600 -o hero.png
             """)
     @OptionGroup var target: TargetOptions
@@ -570,7 +570,7 @@ struct Run: AsyncParsableCommand {
         discussion: """
             {
               "prepare": ["./scripts/seed-demo-data.sh"],   // stdout KEY=VALUE lines become ${KEY}
-              "record": {"app": "build/Grasmere.app", "newInstance": true, "noCursor": true,
+              "record": {"app": "build/MyApp.app", "newInstance": true, "noCursor": true,
                          "env": {"DEMO": "1"}, "untilExit": true, "quitAfter": true, "output": "raw.mov"},
               "cursorScript": "moves.json",          // or an inline array of steps
               "edit": {"trim": "1.2-22", "preset": "promo", "cursor": 1.8,

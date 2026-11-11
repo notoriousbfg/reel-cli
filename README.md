@@ -11,6 +11,11 @@ an agent can record, inspect and edit footage for Mac apps and websites.
 
 No ffmpeg. It uses only Apple frameworks (ScreenCaptureKit, AVFoundation, Core Image).
 
+![Chapters dragged into a new order on a review board, recorded and edited by reel](docs/examples/review-reorder.webp)
+
+*Made with one `reel run` for [Grasmere](https://grasmere.app), a writing app for the
+Mac. More in [Examples](#examples).*
+
 ## Permissions
 
 | Command | Needs |
@@ -43,24 +48,25 @@ it, and scripts with `"coordinates": "window"` are window-relative.
 ## Install
 
 ```sh
+git clone https://github.com/notoriousbfg/reel-cli.git && cd reel-cli
 swift build -c release
 rm -f ~/.local/bin/reel                  # replace, don't overwrite in place (macOS kills
 cp .build/release/reel ~/.local/bin/     # a binary copied over a signed one); any PATH dir
 ```
 
-Requires macOS 15+.
+Requires macOS 15+ and Swift 6 (Xcode 16) to build. Run `reel doctor` to check permissions.
 
 ## Workflow
 
 ```sh
 # 1. Record (Ctrl-C, `reel stop`, --duration or --until-exit to finish)
-reel record --app Grasmere --launch --no-cursor --countdown 3 --duration 25 -o raw.mov
+reel record --app MyApp --launch --no-cursor --countdown 3 --duration 25 -o raw.mov
 reel record --app Safari --open http://localhost:3000 -o site.mov          # websites
-reel record --app build/Debug/Grasmere.app --new-instance --env DEMO=1 \
+reel record --app build/Debug/MyApp.app --new-instance --env DEMO=1 \
   --args "-AppleLanguages (en)" --until-exit --quit-after -o raw.mov       # driven by a test harness
-reel record --app Grasmere --new-instance --start-on ready --stop-on done --tail 1.5 \
+reel record --app MyApp --new-instance --start-on ready --stop-on done --tail 1.5 \
   --timeout 60 --quit-after -o raw.mov   # capture only between the harness's markers
-reel shot --app Grasmere --new-instance --start-on ready --settle 0.5 -o hero.png   # a still
+reel shot --app MyApp --new-instance --start-on ready --settle 0.5 -o hero.png   # a still
 reel mark saved                          # from the harness, while recording
 reel record … --marks-file marks.txt     # sandboxed harness: it appends "<label> <unix time>" lines
 reel mark --import marks.txt --clip raw.mov   # …or import them afterwards
@@ -109,6 +115,48 @@ puts it back once). An act step's `"at"` may name a marker that arrives during t
 
 `reel help formats` documents every JSON file: the events sidecar, cursor
 scripts, presets and scene files.
+
+## Examples
+
+These clips and stills were made with reel for [Grasmere](https://grasmere.app), a
+writing app for the Mac. Each is one scene file run with `reel run`, start to finish,
+with nobody at the mouse.
+
+### Real drags with `act`
+
+![Chapter cards dragged into a new order](docs/examples/review-reorder.webp)
+
+reel performs the drags with real input (`"act"` in the scene), so the app shows its
+own drag images and drop targets. `includeChildWindows` keeps the drag image in the
+picture, `cleanTitlebar` puts the traffic lights back over the capture pill, and the
+edit draws the pointer that `act` actually moved.
+
+### A drawn cursor, a cut and a zoom, all on markers
+
+![A question typed and answered, with the wait cut out](docs/examples/research-ask.webp)
+
+The app runs a scripted demo and sends reel a marker at each step. The
+cursor is drawn from a cursor script timed on those markers and finds the question
+field by its accessibility label. A `cut` between two markers removes the wait for
+the answer, however long it took on that take, and a marker-timed `zoom` fits the
+answer once it lands.
+
+### Zooming in on typing
+
+![A journal entry typed with the view zoomed in](docs/examples/draft-journal.webp)
+
+One `zoom` with `rect=`, from just after the click until just after the last
+keystroke, both named by markers rather than seconds.
+
+### A still
+
+![A document beside its attached PDF, with a passage selected](docs/examples/research-documents.jpg)
+
+A `shot` scene launches the app, waits for a `ready` marker, lets the window settle
+and saves one picture.
+
+The pictures on this page are scaled-down copies; the originals are 1840×1156 at 60 fps.
+See more on [grasmere.app](https://grasmere.app).
 
 ## Edit reference
 
@@ -195,3 +243,7 @@ instead.
 
 `skills/reel/SKILL.md` teaches a coding agent the look → edit → verify loop.
 Copy it to `~/.claude/skills/reel/` (or a project's `.claude/skills/`).
+
+## License
+
+[MIT](LICENSE).

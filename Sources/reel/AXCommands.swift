@@ -9,7 +9,7 @@ struct Locate: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Find UI elements by label and print their frames, normalized to the window. Needs Accessibility.",
         discussion: """
-            reel locate --app Grasmere --label "Highlight" --role button
+            reel locate --app MyApp --label "Highlight" --role button
             reel locate --window-id 22987 --list            # every labelled element
             Coordinates match cursor scripts and --zoom: 0–1 of the window, top-left origin.
             With a recording running and no target given, the recorded window is used.
@@ -67,7 +67,7 @@ struct Act: AsyncParsableCommand {
             window is the target, so one script can be performed for real or only drawn.
             It takes over the pointer and aborts as soon as you move the mouse or press Esc.
 
-              reel record --app Grasmere --launch -o raw.mov &
+              reel record --app MyApp --launch -o raw.mov &
               reel act --script demo.json
               reel stop
             """)
