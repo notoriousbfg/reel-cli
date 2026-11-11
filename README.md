@@ -33,11 +33,19 @@ traffic lights. Record with `--clean-titlebar` and reel stores a still of that c
 (taken before capture, and again after any restart); `reel edit` draws it back over
 the pill automatically. Or crop past the title bar.
 
+Window capture shows only the window itself. Add `--include-child-windows` to also
+capture the app's popovers, menus, sheets and drag images where they overlap the
+window; the picture stays the window's frame. To film the whole screen but still know
+the app's window, use `--display --app X`: `--ax-snapshots`, `--clean-titlebar` and
+`reel act` then work, the sidecar stores the window rect, `edit --crop window` crops to
+it, and scripts with `"coordinates": "window"` are window-relative.
+
 ## Install
 
 ```sh
 swift build -c release
-cp .build/release/reel ~/.local/bin/     # or any directory on your PATH
+rm -f ~/.local/bin/reel                  # replace, don't overwrite in place (macOS kills
+cp .build/release/reel ~/.local/bin/     # a binary copied over a signed one); any PATH dir
 ```
 
 Requires macOS 15+.
@@ -86,8 +94,11 @@ With `--start-on`, reel launches the app but begins capturing only when that
 marker arrives, so set-up never appears in the take; markers sent while waiting
 keep negative times. `reel act` scripts can carry a `"setup"` list performed
 before capture: act runs it, sends the start marker, then performs `"steps"` on
-camera. Scenes add `"prepare"` and `"teardown"` shell commands; prepare can
-print `KEY=VALUE` lines used later as `${KEY}`.
+camera. Without `"setup"`, act follows the recording's clock and waits for a
+`--start-on` recording to start. Scenes add `"prepare"` and `"teardown"` shell commands; prepare can
+print `KEY=VALUE` lines used later as `${KEY}`. A scene's `"act"` performs a script
+with real input during its recording (one command for a take with real hover and
+drag states); its edit then draws the recorded pointer, so drawn and real can't drift.
 
 `reel help formats` documents every JSON file: the events sidecar, cursor
 scripts, presets and scene files.
@@ -97,7 +108,7 @@ scripts, presets and scene files.
 | Flag | Meaning |
 |---|---|
 | `clip.mov:START-END` | trim (seconds; either side optional) |
-| `--crop x,y,w,h` | source pixels, or `%`; `N=` targets clip N |
+| `--crop x,y,w,h` | source pixels, or `%`; `N=` targets clip N. `--crop window`: the app window of a `--display --app` take |
 | `--zoom S-E:SCALE@X,Y` | zoom to a point (output time, normalized **output** coords) |
 | `--zoom src:S-E:SCALE@X,Y` | the same in **source** time and source coords, so re-trimming needs no arithmetic |
 | `--zoom src:S-E:rect=X,Y,W,H` | fit a source region (scale computed, max 3×), e.g. a box from `reel changes` |
@@ -117,7 +128,7 @@ scripts, presets and scene files.
 | `--events file.json` | use another events file; the recorded sidecar is never modified |
 | `--preset NAME` | settings from `~/.config/reel/presets.json`, then `./reel.json`, then (under `reel run`) `reel.json` beside the scene; later files win per field, flags override |
 | `--fade-in --fade-out` | to/from black |
-| `--codec hevc\|h264` | output codec (default hevc) |
+| `--codec hevc\|h264` | output codec (default hevc). Exports render every output frame at `--fps`, so zooms and the drawn cursor stay smooth over static footage |
 | `--preview-at T[,T…]` / `--preview-sheet` | render PNG(s) of the edit instead of exporting |
 | `--dry-run` | print the resolved timeline as JSON |
 

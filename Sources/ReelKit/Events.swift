@@ -22,6 +22,10 @@ public struct RecordingEvents: Codable, Sendable {
     public var synthetic: Bool?
     /// Labelled UI element frames (record --ax-snapshots), at the start and at each marker.
     public var snapshots: [ElementSnapshot]?
+    /// The app's window in global points, when known. Equals captureRect for window
+    /// recordings; inside it for --display --app. Window-relative script coordinates
+    /// and element targets map through it.
+    public var window: Rect?
     /// Images to draw over the source (record --clean-titlebar), applied by `reel edit`.
     public var patches: [Patch]?
 

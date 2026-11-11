@@ -180,8 +180,15 @@ public struct CursorScript: Sendable {
     public var steps: [Step]
     /// `reel act` only: steps performed before the recording starts (ignored when drawing).
     public var setup: [Step]?
+    /// "capture" (default): coordinates are 0–1 of the recorded frame. "window": 0–1 of
+    /// the app's window (sidecar `window`), so one script fits window and display
+    /// recordings, drawn or performed. Element targets are always window-relative.
+    public var coordinates: String?
+    var windowCoordinates: Bool { coordinates == "window" }
 
-    public init(steps: [Step], setup: [Step]? = nil) { self.steps = steps; self.setup = setup }
+    public init(steps: [Step], setup: [Step]? = nil, coordinates: String? = nil) {
+        self.steps = steps; self.setup = setup; self.coordinates = coordinates
+    }
 
     /// Accepts a JSON array of steps, or {"setup": [...], "steps": [...]}.
     public static func load(_ url: URL) throws -> CursorScript {
@@ -191,12 +198,15 @@ public struct CursorScript: Sendable {
     }
 
     public static func parse(_ data: Data, name: String = "cursor script") throws -> CursorScript {
-        struct Wrapped: Decodable { var steps: [Step]?; var setup: [Step]? }
+        struct Wrapped: Decodable { var steps: [Step]?; var setup: [Step]?; var coordinates: String? }
         do {
             if let steps = try? JSONDecoder().decode([Step].self, from: data) { return .init(steps: steps) }
             let w = try JSONDecoder().decode(Wrapped.self, from: data)
             guard w.steps != nil || w.setup != nil else { throw ReelError.message("\(name): expected an array of steps or {\"steps\": [...]}") }
-            return .init(steps: w.steps ?? [], setup: w.setup)
+            if let c = w.coordinates, c != "window", c != "capture" {
+                throw ReelError.message("\(name): \"coordinates\" is \"window\" or \"capture\" (got \"\(c)\")")
+            }
+            return .init(steps: w.steps ?? [], setup: w.setup, coordinates: w.coordinates)
         } catch let e as DecodingError {
             throw ReelError.message("\(name): \(Self.describe(e))")
         }
@@ -228,13 +238,22 @@ public struct CursorScript: Sendable {
         let W = base?.captureRect.width ?? pointsSize.w, H = base?.captureRect.height ?? pointsSize.h
         // Script-defined marks first, so later steps can reference them.
         let markers = self.markers(base: base?.markers ?? [])
-        let resolver = Resolver(width: W, height: H, scale: scale, element: { ref, t in
+        // Window-relative points (elements, "coordinates": "window") → captured frame.
+        let win = base?.window, cap = base?.captureRect
+        func toCapture(_ p: (Double, Double)) -> (Double, Double) {
+            guard let win, let cap, cap.width > 0, cap.height > 0 else { return p }
+            return ((win.x + p.0 * win.width - cap.x) / cap.width, (win.y + p.1 * win.height - cap.y) / cap.height)
+        }
+        let resolver = Resolver(width: windowCoordinates ? (win?.width ?? W) : W,
+                                height: windowCoordinates ? (win?.height ?? H) : H, scale: scale, element: { ref, t in
             guard let base else { throw ReelError.message("element \"\(ref.label)\" needs a recording made with --ax-snapshots") }
             let e = try base.element(ref.label, role: ref.role, index: ref.index ?? 0, at: t)
-            return Resolver.anchor(ref, in: e.frame)
+            return toCapture(Resolver.anchor(ref, in: e.frame))
         })
         func point(_ c: Target, _ what: String, _ t: Double) throws -> (Double, Double) {
-            try resolver.point(c, at: t, what)
+            let p = try resolver.point(c, at: t, what)
+            if case .point = c, windowCoordinates { return toCapture(p) }
+            return p
         }
 
         enum Ease { case inOut, linear }
@@ -339,6 +358,7 @@ public struct CursorScript: Sendable {
         ev.markers = markers.isEmpty ? nil : markers
         ev.shapes = shapes.isEmpty ? nil : shapes.sorted { $0.t < $1.t }
         ev.synthetic = true
+        ev.window = base?.window
         return ev
     }
 }

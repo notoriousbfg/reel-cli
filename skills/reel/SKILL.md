@@ -67,6 +67,11 @@ take whose marker never comes (exit 1 before capture, 4 after). Put pre-roll act
 an act script's `"setup"` list. Scenes take `"prepare"`/`"teardown"` commands and
 `${VAR}`s; `{"shot": {...}}` (or `reel shot`) makes a still instead of a video.
 
+Popovers, menus and sheets are separate windows: record with `--include-child-windows`
+or they won't appear. For full-screen takes use `--display --app X` (AX snapshots,
+`--clean-titlebar` and `reel act` still work) and `edit --crop window` to get back to the
+window; write scripts with `"coordinates": "window"` so they fit either kind of take.
+
 Record with `--clean-titlebar` so the purple sharing pill never shows in edits. Skip dead
 time by marker: `--cut asked+1..answered-0.3` or `--speed asked+1..answered-0.3=6`; times
 after it (markers, cursor, src: zooms) still line up. Reject takes whose record JSON shows
@@ -90,7 +95,9 @@ Optional, needs Accessibility (`reel doctor` shows `accessibility`):
   drawing can resolve it.
 - `reel act --script s.json` during `reel record` performs the script with real input (true hover,
   selection and drag states). Ask the user first: it takes over their pointer, and it aborts if
-  they touch the mouse.
+  they touch the mouse. Without `--now` it follows the recording's clock, waiting for a
+  `--start-on` recording to start. In a scene, `"act": "act.json"` does record + act in one
+  command, and the edit draws the recorded pointer (`"cursorFrom": "script"` to override).
 
 Batches: put shared styling in `./reel.json` presets (`--preset promo`), or a whole
 take in a scene file and iterate with `reel run scene.json --edit-only --preview check.png`.

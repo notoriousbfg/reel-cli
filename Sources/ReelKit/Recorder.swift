@@ -31,7 +31,8 @@ public struct RecordOptions: Sendable {
     public var tail: Double = 0        // seconds to keep recording after the stop marker
     public var markerTimeout: Double?  // bound on each marker wait; fails the take
     public var cleanTitlebar = false
-    public var forceQuit = false       // if the app won't quit (a sheet is open), force it   // store a still of the traffic-light corner to patch over the capture pill
+    public var forceQuit = false       // if the app won't quit (a sheet is open), force it
+    public var includeChildWindows = false // also capture the app's popovers, menus and drag images over the window   // store a still of the traffic-light corner to patch over the capture pill
     public var openURL: String?        // URL/file to open in the app (e.g. localhost for web devs)
     public var windowTitle: String?    // substring match on window title
     public var windowID: UInt32?
@@ -161,10 +162,17 @@ public final class Recorder: @unchecked Sendable {
         }
         if opts.axSnapshots {
             try Accessibility.require("--ax-snapshots")
-            if opts.display { throw ReelError.message("--ax-snapshots records one window; drop --display") }
+            if opts.display && opts.app == nil && opts.pid == nil {
+                throw ReelError.message("--ax-snapshots with --display needs --app or --pid to know which window")
+            }
+        }
+        if opts.includeChildWindows && opts.display {
+            throw ReelError.message("--include-child-windows records one window (with its popovers); drop --display")
         }
         if opts.cleanTitlebar {
-            if opts.display { throw ReelError.message("--clean-titlebar needs a window recording; drop --display") }
+            if opts.display && opts.app == nil && opts.pid == nil {
+                throw ReelError.message("--clean-titlebar with --display needs --app or --pid to know which window")
+            }
             if !opts.trackCursor { throw ReelError.message("--clean-titlebar stores its patch in the events sidecar; drop --no-events") }
         }
         try FileManager.default.createDirectory(at: opts.output.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -174,24 +182,29 @@ public final class Recorder: @unchecked Sendable {
         var (state, marksWatcher) = try arm(target: target, pid: targetPID, log: log)
         defer { RecordingState.remove() }
         defer { marksWatcher?.stop() }
-        var filter = target.filter
         if let label = opts.startOn {
             do { try await waitForStart(label, state: state, pid: targetPID, signals: signals, log: log) }
             catch { _ = await quitIfAsked(targetPID, log: log); throw error }
             if let pid = targetPID, !Self.alive(pid) {
                 throw ReelError.message("The app exited before capture started")
             }
-            if let fresh = await freshFilter(target) { filter = fresh }   // it may have moved during setup
         }
-        let info = SCShareableContent.info(for: filter)
-        let scale = Double(info.pointPixelScale)
-        let rect = info.contentRect
+        // Measured now, after any setup that moved or resized the window.
+        let geo = try await geometry(target)
+        let filter = geo.filter
+        let scale = geo.scale
+        let rect = geo.rect
+        let windowRect = geo.window?.frame
+        if (opts.axSnapshots || opts.cleanTitlebar) && geo.window == nil {
+            throw ReelError.message("Couldn't find the app's window for --ax-snapshots / --clean-titlebar")
+        }
         let width = Int((rect.width * scale).rounded()) & ~1
         let height = Int((rect.height * scale).rounded()) & ~1
 
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
+        if let src = geo.sourceRect { config.sourceRect = src }
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(opts.fps))
         config.showsCursor = opts.showsCursor
         config.captureResolution = .best
@@ -220,21 +233,23 @@ public final class Recorder: @unchecked Sendable {
         func titlebarStill(at t: Double?) async {
             guard opts.cleanTitlebar else { return }
             let name = "\(base).titlebar\(titlebars.isEmpty ? "" : "-\(titlebars.count + 1)").png"
+            guard let win = geo.window else { return }
+            let stillFilter = SCContentFilter(desktopIndependentWindow: win)
             do {
-                let w = min(90, rect.width), h = min(40, rect.height)
+                let w = min(90, win.frame.width), h = min(40, win.frame.height)
                 let c = SCStreamConfiguration()
                 c.sourceRect = CGRect(x: 0, y: 0, width: w, height: h)
                 c.width = Int((w * scale).rounded()); c.height = Int((h * scale).rounded())
                 c.showsCursor = false
                 c.captureResolution = .best
-                var img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
+                var img = try await SCScreenshotManager.captureImage(contentFilter: stillFilter, configuration: c)
                 if t != nil {
                     // After a stream stops, macOS fades the traffic lights back in; wait
                     // (up to 1s) until two stills ~0.12s apart match.
                     let deadline = Date().addingTimeInterval(1)
                     while Date() < deadline {
                         try await Task.sleep(for: .milliseconds(120))
-                        let next = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
+                        let next = try await SCScreenshotManager.captureImage(contentFilter: stillFilter, configuration: c)
                         let settled = Self.meanDifference(img, next) < 0.004
                         img = next
                         if settled { break }
@@ -242,7 +257,9 @@ public final class Recorder: @unchecked Sendable {
                 }
                 try Stills.writeImage(img, to: dir.appendingPathComponent(name))
                 if !titlebars.isEmpty { titlebars[titlebars.count - 1].end = t }
-                titlebars.append(.init(image: name, x: 0, y: 0, width: Double(img.width), height: Double(img.height),
+                // Where the window's corner sits in the video (0,0 for window captures).
+                let ox = ((win.frame.minX - rect.minX) * scale).rounded(), oy = ((win.frame.minY - rect.minY) * scale).rounded()
+                titlebars.append(.init(image: name, x: ox, y: oy, width: Double(img.width), height: Double(img.height),
                                        start: t, feather: (8 * scale).rounded()))
             } catch {
                 log("warning: --clean-titlebar still failed: \(ErrorInfo(error).summary)")
@@ -256,6 +273,8 @@ public final class Recorder: @unchecked Sendable {
         let startedAt = Date().timeIntervalSince1970
         state.captureStartedAt = startedAt
         state.captureRect = .init(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height)
+        state.windowRect = windowRect.map { .init(x: $0.minX, y: $0.minY, width: $0.width, height: $0.height) }
+        state.windowID = target.appWindowID
         try state.update()
         var parts: [(segment: CaptureSegment, offset: Double)] = [(current, 0)]
         let tracker = opts.trackCursor ? CursorTracker(captureRect: rect, start: t0, shapes: opts.cursorShapes) : nil
@@ -267,7 +286,7 @@ public final class Recorder: @unchecked Sendable {
                                : "Press Ctrl-C or run `reel stop` to finish"))
         var snapper: Snapshotter?
         if opts.axSnapshots, let pid = targetPID {
-            snapper = Snapshotter(window: .init(pid: pid, windowID: target.windowID, frame: rect, title: target.title),
+            snapper = Snapshotter(window: .init(pid: pid, windowID: target.appWindowID, frame: windowRect ?? rect, title: target.title),
                                   state: state, log: log)
             snapper?.start()
         }
@@ -412,6 +431,7 @@ public final class Recorder: @unchecked Sendable {
             events.shapes = tracker.shapes.isEmpty ? nil : tracker.shapes
             events.snapshots = snapshots.isEmpty ? nil : snapshots
             events.patches = titlebars.isEmpty ? nil : titlebars
+            events.window = windowRect.map { .init(x: $0.minX, y: $0.minY, width: $0.width, height: $0.height) }
             try events.write(for: opts.output)
             eventsPath = RecordingEvents.sidecarURL(for: opts.output).path
         }
@@ -455,7 +475,7 @@ public final class Recorder: @unchecked Sendable {
     private func arm(target: Target, pid: Int32?, log: @escaping (String) -> Void) throws -> (RecordingState, MarksFileWatcher?) {
         var state = RecordingState(pid: getpid(), output: opts.output.path, startedAt: Date().timeIntervalSince1970)
         state.targetPID = pid
-        state.windowID = target.windowID
+        state.windowID = target.appWindowID
         state.startOn = opts.startOn
         let r = SCShareableContent.info(for: target.filter).contentRect
         state.captureRect = .init(x: r.minX, y: r.minY, width: r.width, height: r.height)
@@ -479,6 +499,42 @@ public final class Recorder: @unchecked Sendable {
             }
             try await Task.sleep(for: .milliseconds(15))
         }
+    }
+
+    struct Geometry {
+        var filter: SCContentFilter
+        var sourceRect: CGRect?     // within the display, for --include-child-windows
+        var rect: CGRect            // captured area, global points (top-left origin)
+        var scale: Double
+        var window: SCWindow?       // the app's window, as it is now
+    }
+
+    /// What to capture, measured now. --include-child-windows captures the display
+    /// through a filter of the app's windows, cropped to the target window's frame,
+    /// so popovers, menus and drag images appear in place.
+    private func geometry(_ target: Target) async throws -> Geometry {
+        let content = try? await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        let win = target.appWindowID.flatMap { id in content?.windows.first { $0.windowID == id } }
+        if opts.includeChildWindows {
+            guard let win, let app = win.owningApplication, let content else {
+                throw ReelError.message("The window is no longer on screen")
+            }
+            let mid = CGPoint(x: win.frame.midX, y: win.frame.midY)
+            guard let display = content.displays.first(where: { $0.frame.contains(mid) }) ?? content.displays.first else {
+                throw ReelError.message("No display found")
+            }
+            let f = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+            let info = SCShareableContent.info(for: f)
+            let d = display.frame
+            let src = CGRect(x: win.frame.minX - d.minX, y: win.frame.minY - d.minY, width: win.frame.width, height: win.frame.height)
+                .intersection(CGRect(origin: .zero, size: d.size))
+            return Geometry(filter: f, sourceRect: src,
+                            rect: CGRect(x: src.minX + d.minX, y: src.minY + d.minY, width: src.width, height: src.height),
+                            scale: Double(info.pointPixelScale), window: win)
+        }
+        let f = (target.windowID != nil ? win.map { SCContentFilter(desktopIndependentWindow: $0) } : nil) ?? target.filter
+        let info = SCShareableContent.info(for: f)
+        return Geometry(filter: f, sourceRect: nil, rect: info.contentRect, scale: Double(info.pointPixelScale), window: win)
     }
 
     /// A filter for the window as it is now (setup may have moved or resized it).
@@ -690,7 +746,12 @@ public final class Recorder: @unchecked Sendable {
             || owner.applicationName.lowercased() == appName
     }
 
-    struct Target { var filter: SCContentFilter; var label: String; var title: String?; var pid: Int32?; var windowID: UInt32? }
+    struct Target {
+        var filter: SCContentFilter; var label: String; var title: String?; var pid: Int32?; var windowID: UInt32?
+        /// The app's window, also for display recordings with --app/--pid (for AX snapshots,
+        /// --clean-titlebar, `reel act` and window-relative coordinates).
+        var appWindowID: UInt32?
+    }
 
     private func resolveTarget(pid: Int32?, launchedNew: Bool, log: (String) -> Void) async throws -> Target {
         let deadline = Date().addingTimeInterval(opts.windowTimeout)
@@ -709,8 +770,19 @@ public final class Recorder: @unchecked Sendable {
                         return a.bundleIdentifier.lowercased() == app || a.applicationName.lowercased() == app
                     }
                     if !apps.isEmpty {
+                        // The app's main window: by id/title if given, else its largest.
+                        let ids = Set(apps.map(\.processID))
+                        var wins = content.windows.filter {
+                            $0.windowLayer == 0 && $0.isOnScreen && $0.frame.width > 50 && $0.frame.height > 50
+                                && ($0.owningApplication.map { ids.contains($0.processID) } ?? false)
+                        }
+                        if let id = opts.windowID { wins = wins.filter { $0.windowID == id } }
+                        if let t = opts.windowTitle?.lowercased() { wins = wins.filter { ($0.title ?? "").lowercased().contains(t) } }
+                        let main = wins.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
                         return Target(filter: SCContentFilter(display: display, including: apps, exceptingWindows: []),
-                                      label: "\(opts.app ?? "pid \(pid!)") on display", title: nil, pid: pid, windowID: nil)
+                                      label: "\(opts.app ?? "pid \(pid!)") on display", title: main?.title,
+                                      pid: pid ?? main?.owningApplication?.processID ?? apps.first?.processID, windowID: nil,
+                                      appWindowID: main?.windowID)
                     }
                 } else {
                     return Target(filter: SCContentFilter(display: display, excludingWindows: []),
@@ -748,7 +820,7 @@ public final class Recorder: @unchecked Sendable {
                     }
                     let name = w.owningApplication?.applicationName ?? "window"
                     return Target(filter: SCContentFilter(desktopIndependentWindow: w), label: "\(name) “\(w.title ?? "")”",
-                                  title: w.title, pid: w.owningApplication?.processID, windowID: w.windowID)
+                                  title: w.title, pid: w.owningApplication?.processID, windowID: w.windowID, appWindowID: w.windowID)
                 }
             }
             if Date() > deadline {
@@ -926,14 +998,17 @@ public struct RecordingState: Codable, Sendable {
     public var targetPID: Int32?
     public var windowID: UInt32?
     public var captureRect: RecordingEvents.Rect?
+    /// The app's window (global points); differs from captureRect for display recordings.
+    public var windowRect: RecordingEvents.Rect?
     /// With --start-on: the marker capture waits for, and the Unix time capture began.
     /// `startedAt` is then the time reel armed; marks are stored relative to it and
     /// shifted onto the capture clock (earlier ones become negative).
     public var startOn: String?
     public var captureStartedAt: Double?
 
-    /// Unix time of the capture's t=0 (nil while waiting for the start marker).
-    public var t0: Double? { startOn == nil ? startedAt : captureStartedAt }
+    /// Unix time of the capture's t=0 (nil until capture starts: while waiting for the
+    /// start marker, and while reel is still setting up after arming).
+    public var t0: Double? { captureStartedAt }
     var shift: Double { (captureStartedAt ?? startedAt) - startedAt }
 
     public init(pid: Int32, output: String, startedAt: Double) {

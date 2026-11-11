@@ -57,7 +57,25 @@ public enum Planner {
             var crop = EditPlan.PixelRect(x: 0, y: 0, width: size.width, height: size.height)
             for c in o.crops {
                 let (idx, v) = Parse.indexed(c)
-                if idx == nil || idx == n + 1 { crop = try Parse.crop(v, sourceWidth: size.width, sourceHeight: size.height) }
+                guard idx == nil || idx == n + 1 else { continue }
+                if v.lowercased() == "window" {
+                    // The app window's rect from the events (display recordings with --app).
+                    var file = RecordingEvents.sidecarURL(for: url)
+                    for e in o.events { let (i, p) = Parse.indexed(e); if i == nil || i == n + 1 { file = URL(fileURLWithPath: p) } }
+                    guard let ev = try? RecordingEvents.read(file) else {
+                        throw ReelError.message("--crop window needs the events sidecar of \(url.lastPathComponent)")
+                    }
+                    if let w = ev.window {
+                        let k = Double(size.width) / ev.captureRect.width    // video pixels per point
+                        let r = CGRect(x: (w.x - ev.captureRect.x) * k, y: (w.y - ev.captureRect.y) * k,
+                                       width: w.width * k, height: w.height * k)
+                            .intersection(CGRect(x: 0, y: 0, width: size.width, height: size.height))
+                        guard r.width > 2, r.height > 2 else { throw ReelError.message("--crop window: the window is outside the recording") }
+                        crop = .init(x: r.minX.rounded(), y: r.minY.rounded(), width: r.width.rounded(), height: r.height.rounded())
+                    }   // no window rect: a window recording, which is already the window
+                } else {
+                    crop = try Parse.crop(v, sourceWidth: size.width, sourceHeight: size.height)
+                }
             }
             var speed = 1.0
             for s in o.speeds {
@@ -304,134 +322,190 @@ public enum AppKitSession {
 // MARK: - Export
 
 public enum Exporter {
+    /// Renders the plan frame by frame: for every OUTPUT frame time, each visible
+    /// clip contributes its latest source frame at or before the matching source
+    /// time (held when the source has no new frame), and zoom, cursor, click rings,
+    /// transitions and fades are evaluated at that output time. Zooms are therefore
+    /// smooth even over a completely static picture, at exactly `plan.fps`.
     public static func export(_ plan: EditPlan, to output: URL, hevc: Bool,
                               progress: (@Sendable (Double) -> Void)? = nil) async throws {
         let composer = try Composer(plan: plan)
-        let comp = AVMutableComposition()
-        let videoTracks = (0..<min(2, plan.clips.count)).map { _ in
-            comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)!
-        }
-        var audioTracks: [AVMutableCompositionTrack] = []
-        let starts = plan.clipStarts
-        let ts: CMTimeScale = 6000
-        func cm(_ s: Double) -> CMTime { CMTime(seconds: s, preferredTimescale: ts) }
+        let W = plan.canvas.width, H = plan.canvas.height
+        let fps = max(1, plan.fps)
+        let total = plan.totalDuration
+        let frameCount = max(1, Int((total * Double(fps) - 1e-6).rounded(.up)))
 
-        for (i, clip) in plan.clips.enumerated() {
-            let asset = AVURLAsset(url: URL(fileURLWithPath: clip.path))
-            let src = CMTimeRange(start: cm(clip.trimStart), end: cm(clip.trimEnd))
-            let at = cm(starts[i])
-            let outDur = cm(clip.duration)
-
-            let vt = videoTracks[i % 2]
-            if let v = try await asset.loadTracks(withMediaType: .video).first {
-                try insert(v, src, into: vt, at: at, scaledTo: outDur)
-            }
-            if !plan.mute, let a = try await asset.loadTracks(withMediaType: .audio).first {
-                while audioTracks.count <= i % 2 {
-                    audioTracks.append(comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)!)
-                }
-                try insert(a, src, into: audioTracks[i % 2], at: at, scaledTo: outDur)
-            }
-        }
-
-        // One instruction per span with a constant set of visible clips.
-        var cuts = Set<Double>([0, plan.totalDuration])
-        for (i, c) in plan.clips.enumerated() { cuts.insert(starts[i]); cuts.insert(starts[i] + c.duration) }
-        // Instructions must tile the composition exactly; scaled (sped-up) ranges
-        // round, so the last one ends where the composition really ends.
-        let end = comp.duration
-        let times = cuts.sorted().filter { end.seconds - $0 > 1e-3 } + [end.seconds]
-        var instructions: [ReelInstruction] = []
-        var prev = CMTime.zero
-        for (a, b) in zip(times, times.dropFirst()) where b - a > 1e-4 {
-            let mid = (a + b) / 2
-            let layers = plan.activeClips(at: min(mid, plan.totalDuration - 1e-4)).map { (trackID: videoTracks[$0 % 2].trackID, clip: $0) }
-            let stop = b == times.last ? end : cm(b)
-            instructions.append(ReelInstruction(range: CMTimeRange(start: prev, end: stop), layers: layers, composer: composer))
-            prev = stop
-        }
-
-        let vc = AVMutableVideoComposition()
-        vc.customVideoCompositorClass = ReelCompositor.self
-        vc.renderSize = CGSize(width: plan.canvas.width, height: plan.canvas.height)
-        vc.frameDuration = CMTime(value: 1, timescale: CMTimeScale(plan.fps))
-        vc.instructions = instructions
-
-        let preset = hevc ? AVAssetExportPresetHEVCHighestQuality : AVAssetExportPresetHighestQuality
-        guard let session = AVAssetExportSession(asset: comp, presetName: preset) else {
-            throw ReelError.message("Could not create export session")
-        }
-        session.videoComposition = vc
         try? FileManager.default.removeItem(at: output)
         let type: AVFileType = output.pathExtension.lowercased() == "mov" ? .mov : .mp4
+        let writer = try AVAssetWriter(outputURL: output, fileType: type)
+        let pixels = Double(W * H * fps)
+        let video = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: hevc ? AVVideoCodecType.hevc : AVVideoCodecType.h264,
+            AVVideoWidthKey: W, AVVideoHeightKey: H,
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ],
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: max(6_000_000, Int(pixels * (hevc ? 0.08 : 0.14))),
+                AVVideoExpectedSourceFrameRateKey: fps,
+                AVVideoMaxKeyFrameIntervalDurationKey: 2,
+            ],
+        ])
+        video.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: video, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: W, kCVPixelBufferHeightKey as String: H,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Int](),
+        ])
+        writer.add(video)
+        let audio = plan.mute ? nil : try await AudioTrack.make(plan)
+        if let audio { writer.add(audio.input) }
+        guard writer.startWriting() else { throw ReelError.message("Cannot write \(output.path): \(writer.error.map { ErrorInfo($0).summary } ?? "")") }
+        writer.startSession(atSourceTime: .zero)
+        let audioDone = audio.map { a in Task { await a.pump() } }
 
-        let monitor = Task {
-            guard let progress else { return }
-            for await state in session.states(updateInterval: 0.5) {
-                if case .exporting(let p) = state { progress(p.fractionCompleted) }
+        let context = CIContext(options: [.cacheIntermediates: false])
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        var readers: [Int: ClipFrames] = [:]
+        for k in 0..<frameCount {
+            let t = Double(k) / Double(fps)
+            let active = plan.activeClips(at: min(t, total - 1e-6))
+            for i in readers.keys where !active.contains(i) { readers[i] = nil }   // done with that clip
+            var sources: [Int: CIImage] = [:]
+            for i in active {
+                if readers[i] == nil { readers[i] = try await ClipFrames(clip: plan.clips[i]) }
+                if let img = readers[i]!.frame(at: plan.sourceTime(clip: i, at: t)) { sources[i] = img }
+            }
+            let img = composer.image(at: t, sources: sources)
+            while !video.isReadyForMoreMediaData {
+                if writer.status == .failed { break }
+                try await Task.sleep(for: .milliseconds(2))
+            }
+            guard writer.status == .writing, let pool = adaptor.pixelBufferPool else { break }
+            var pb: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
+            guard let pb else { throw ReelError.message("Cannot allocate a frame buffer") }
+            context.render(img, to: pb, bounds: CGRect(x: 0, y: 0, width: W, height: H), colorSpace: colorSpace)
+            if !adaptor.append(pb, withPresentationTime: CMTime(value: CMTimeValue(k), timescale: CMTimeScale(fps))) { break }
+            if k % 15 == 0 { progress?(Double(k) / Double(frameCount)) }
+        }
+        video.markAsFinished()
+        await audioDone?.value
+        writer.endSession(atSourceTime: CMTime(value: CMTimeValue(frameCount), timescale: CMTimeScale(fps)))
+        await writer.finishWriting()
+        if writer.status != .completed {
+            throw ReelError.message("Export failed: \(writer.error.map { ErrorInfo($0).summary } ?? "status \(writer.status.rawValue)")")
+        }
+        progress?(1)
+    }
+}
+
+/// Sequential frames of one plan clip. `frame(at:)` returns the latest frame at or
+/// before a source time (or the first one), holding it until a newer one is due.
+final class ClipFrames {
+    private let reader: AVAssetReader
+    private let output: AVAssetReaderTrackOutput
+    private var current: CMSampleBuffer?
+    private var next: CMSampleBuffer?
+
+    init(clip: EditPlan.Clip) async throws {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: clip.path))
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw ReelError.message("\(clip.path) has no video track")
+        }
+        reader = try AVAssetReader(asset: asset)
+        let ts: CMTimeScale = 6000
+        // From a little before the trim, so the frame showing at trimStart is included.
+        let start = max(0, clip.trimStart - 1)
+        reader.timeRange = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: ts),
+                                       end: CMTime(seconds: clip.trimEnd + 0.5, preferredTimescale: ts))
+        output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Int](),
+        ])
+        output.alwaysCopiesSampleData = false
+        reader.add(output)
+        guard reader.startReading() else {
+            throw ReelError.message("Cannot read \(clip.path): \(reader.error.map { ErrorInfo($0).summary } ?? "")")
+        }
+        next = output.copyNextSampleBuffer()
+    }
+
+    func frame(at t: Double) -> CIImage? {
+        while let n = next, CMSampleBufferGetPresentationTimeStamp(n).seconds <= t + 1e-4 {
+            current = n
+            next = output.copyNextSampleBuffer()
+        }
+        guard let sb = current ?? next, let pb = CMSampleBufferGetImageBuffer(sb) else { return nil }
+        return CIImage(cvPixelBuffer: pb)
+    }
+
+    deinit { reader.cancelReading() }
+}
+
+/// Audio for the edit: the clips' audio placed and retimed like their video, mixed,
+/// and fed to the writer as it asks for it.
+final class AudioTrack: @unchecked Sendable {
+    let input: AVAssetWriterInput
+    private let reader: AVAssetReader
+    private let output: AVAssetReaderAudioMixOutput
+
+    private init(input: AVAssetWriterInput, reader: AVAssetReader, output: AVAssetReaderAudioMixOutput) {
+        self.input = input; self.reader = reader; self.output = output
+    }
+
+    static func make(_ plan: EditPlan) async throws -> AudioTrack? {
+        let comp = AVMutableComposition()
+        let ts: CMTimeScale = 6000
+        func cm(_ s: Double) -> CMTime { CMTime(seconds: s, preferredTimescale: ts) }
+        var tracks: [AVMutableCompositionTrack] = []
+        let starts = plan.clipStarts
+        for (i, clip) in plan.clips.enumerated() {
+            let asset = AVURLAsset(url: URL(fileURLWithPath: clip.path))
+            guard let a = try await asset.loadTracks(withMediaType: .audio).first else { continue }
+            while tracks.count <= i % 2 {
+                tracks.append(comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)!)
+            }
+            let dest = tracks[i % 2]
+            let range = CMTimeRange(start: cm(clip.trimStart), end: cm(clip.trimEnd))
+            let at = cm(starts[i])
+            if dest.timeRange.end.isValid, at > dest.timeRange.end { dest.insertEmptyTimeRange(CMTimeRange(start: dest.timeRange.end, end: at)) }
+            try dest.insertTimeRange(range, of: a, at: at)
+            if abs(clip.speed - 1) > 1e-3 { dest.scaleTimeRange(CMTimeRange(start: at, duration: range.duration), toDuration: cm(clip.duration)) }
+        }
+        guard !tracks.isEmpty else { return nil }
+        let reader = try AVAssetReader(asset: comp)
+        reader.timeRange = CMTimeRange(start: .zero, duration: cm(plan.totalDuration))
+        let output = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2,
+        ])
+        reader.add(output)
+        guard reader.startReading() else { return nil }
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 192_000,
+        ])
+        input.expectsMediaDataInRealTime = false
+        return AudioTrack(input: input, reader: reader, output: output)
+    }
+
+    /// Feeds all audio to the writer, then marks the input finished.
+    func pump() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let queue = DispatchQueue(label: "reel.audio")
+            input.requestMediaDataWhenReady(on: queue) { [self] in
+                while input.isReadyForMoreMediaData {
+                    guard let sb = output.copyNextSampleBuffer() else {
+                        input.markAsFinished()
+                        c.resume()
+                        return
+                    }
+                    input.append(sb)
+                }
             }
         }
-        defer { monitor.cancel() }
-        do { try await session.export(to: output, as: type) }
-        catch { throw ReelError.message("Export failed: \(ErrorInfo(error).summary)") }
-    }
-
-    private static func insert(_ track: AVAssetTrack, _ range: CMTimeRange, into dest: AVMutableCompositionTrack,
-                               at: CMTime, scaledTo duration: CMTime) throws {
-        let end = dest.timeRange.end
-        if end.isValid, at > end {
-            dest.insertEmptyTimeRange(CMTimeRange(start: end, end: at))
-        }
-        try dest.insertTimeRange(range, of: track, at: at)
-        if abs(range.duration.seconds - duration.seconds) > 1e-3 {
-            dest.scaleTimeRange(CMTimeRange(start: at, duration: range.duration), toDuration: duration)
-        }
-    }
-}
-
-final class ReelInstruction: NSObject, AVVideoCompositionInstructionProtocol, @unchecked Sendable {
-    let timeRange: CMTimeRange
-    let enablePostProcessing = false
-    let containsTweening = true
-    let requiredSourceTrackIDs: [NSValue]?
-    let passthroughTrackID: CMPersistentTrackID = kCMPersistentTrackID_Invalid
-    let layers: [(trackID: CMPersistentTrackID, clip: Int)]
-    let composer: Composer
-
-    init(range: CMTimeRange, layers: [(trackID: CMPersistentTrackID, clip: Int)], composer: Composer) {
-        timeRange = range
-        self.layers = layers
-        self.composer = composer
-        requiredSourceTrackIDs = layers.map { NSNumber(value: $0.trackID) }
-    }
-}
-
-final class ReelCompositor: NSObject, AVVideoCompositing, @unchecked Sendable {
-    private static let attrs: [String: any Sendable] = [
-        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-        kCVPixelBufferIOSurfacePropertiesKey as String: [String: Int](),
-    ]
-    let sourcePixelBufferAttributes: [String: any Sendable]? = ReelCompositor.attrs
-    let requiredPixelBufferAttributesForRenderContext: [String: any Sendable] = ReelCompositor.attrs
-    private let context = CIContext(options: [.cacheIntermediates: false])
-    private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-
-    func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {}
-
-    func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
-        guard let instr = request.videoCompositionInstruction as? ReelInstruction,
-              let out = request.renderContext.newPixelBuffer() else {
-            request.finish(with: ReelError.message("compositor setup failed"))
-            return
-        }
-        var sources: [Int: CIImage] = [:]
-        for l in instr.layers {
-            if let pb = request.sourceFrame(byTrackID: l.trackID) { sources[l.clip] = CIImage(cvPixelBuffer: pb) }
-        }
-        let img = instr.composer.image(at: request.compositionTime.seconds, sources: sources)
-        let size = request.renderContext.size
-        context.render(img, to: out, bounds: CGRect(origin: .zero, size: size), colorSpace: colorSpace)
-        request.finish(withComposedVideoFrame: out)
     }
 }
 

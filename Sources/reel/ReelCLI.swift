@@ -42,7 +42,7 @@ struct Reel: AsyncParsableCommand {
             `locate`, `act` and `record --ax-snapshots` also need Accessibility.
             File formats (events sidecar, cursor scripts, presets, scenes): reel help formats
             """,
-        version: "0.4.1",
+        version: "0.5.0",
         subcommands: [Record.self, Shot.self, Stop.self, Mark.self, Windows.self, Edit.self, Run.self, Cursor.self,
                       Changes.self, Info.self, Frame.self, Sheet.self, Locate.self, Act.self, Doctor.self, Formats.self]
     )
@@ -91,6 +91,8 @@ struct Record: AsyncParsableCommand {
     var noCursorShapes = false
     @Option(help: "Restart capture up to this many times if macOS stops the stream.")
     var maxRestarts = 5
+    @Flag(help: "Also capture the app's popovers, menus, sheets and drag images over the window (composited in place; the picture stays the window's frame).")
+    var includeChildWindows = false
     @Flag(help: "Hide macOS's purple \"being shared\" pill over the window's traffic lights: store a still of that corner, which `reel edit` draws over it.")
     var cleanTitlebar = false
     @Option(help: "Seconds to count down before recording.")
@@ -110,7 +112,7 @@ struct Record: AsyncParsableCommand {
         var o = try target.options(output: absURL(output))
         o.untilExit = untilExit; o.axSnapshots = axSnapshots
         o.cursorShapes = !noCursorShapes; o.maxRestarts = max(0, maxRestarts)
-        o.stopOn = stopOn; o.tail = max(0, tail); o.cleanTitlebar = cleanTitlebar
+        o.stopOn = stopOn; o.tail = max(0, tail); o.cleanTitlebar = cleanTitlebar; o.includeChildWindows = includeChildWindows
         o.duration = duration; o.countdown = countdown; o.fps = fps
         o.showsCursor = !noCursor; o.trackCursor = !noEvents; o.hevc = !h264
         if untilExit && target.pid == nil && target.app == nil && target.windowID == nil && target.windowTitle == nil {
@@ -368,6 +370,7 @@ struct Edit: AsyncParsableCommand {
 
             Examples:
               --crop 0,56,2400,1500          --crop 10%,10%,80%,80%     --crop 2=0,0,1280,800
+              --crop window                  the app window of a `record --display --app` take
               --auto-zoom 2                  --transition crossfade:0.8 --transition 2=slide-left:0.5
               --padding 96 --background '#0f2027,#2c5364' --corner-radius 22 --shadow
               --cursor 1.8 --cursor-script moves.json      --preset promo
@@ -581,6 +584,9 @@ struct Run: AsyncParsableCommand {
             "record": {"startOn": "ready", "stopOn": "done", "tail": 1.5, "timeout": 60}.
             Keys are the long flags of `reel record` / `reel edit` in camelCase. Lists
             repeat a flag; true sets a flag; false sets --no-… where one exists.
+            "act": "act.json" (or inline) performs a script with real input during the
+            recording (needs Accessibility); without a stop condition the take ends after it.
+            The edit then draws the recorded pointer; "cursorFrom": "script" draws "cursorScript".
             Paths are relative to the scene file. Presets come from ~/.config/reel/presets.json,
             then reel.json in the working directory, then reel.json beside the scene file
             (later files win, field by field).
@@ -602,7 +608,7 @@ struct Run: AsyncParsableCommand {
         guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ReelError.message("\(url.lastPathComponent) must be a JSON object with \"record\", \"shot\" and/or \"edit\"")
         }
-        let unknown = Set(json.keys).subtracting(["record", "shot", "edit", "cursorScript", "prepare", "teardown", "name", "notes"])
+        let unknown = Set(json.keys).subtracting(["record", "shot", "edit", "cursorScript", "act", "cursorFrom", "prepare", "teardown", "name", "notes"])
         if !unknown.isEmpty { throw ReelError.message("Unknown scene keys: \(unknown.sorted().joined(separator: ", "))") }
         if json["shot"] != nil && (json["record"] != nil || json["edit"] != nil) {
             throw ReelError.message("A scene makes a still (\"shot\") or a video (\"record\"/\"edit\"), not both")
@@ -653,7 +659,7 @@ struct Run: AsyncParsableCommand {
             vars.values["OUT_DIR"] = finalOut.deletingLastPathComponent().path
             // An edit-only run needs the edit, the cursor script and the recording's
             // name, not the record block's launch settings.
-            for key in (doTake ? ["record", "shot", "edit", "cursorScript"] : ["edit", "cursorScript"]) where json[key] != nil {
+            for key in (doTake ? ["record", "shot", "edit", "cursorScript", "act"] : ["edit", "cursorScript"]) where json[key] != nil {
                 json[key] = try vars.expandAny(json[key]!)
             }
             if !doTake, var rec = json["record"] as? [String: Any], let o = rec["output"] {
@@ -691,7 +697,11 @@ struct Run: AsyncParsableCommand {
         if doTake, let rec {
             log("── record")
             var cmd = try Record.parse(try SceneArgs.flags(rec, invertible: []))
-            try await cmd.run()
+            if let act = json["act"] {
+                try await recordWithAct(&cmd, rec: rec, act: act)
+            } else {
+                try await cmd.run()
+            }
         } else if doTake && json["edit"] == nil {
             throw ReelError.message("Scene has nothing to do")
         }
@@ -707,7 +717,12 @@ struct Run: AsyncParsableCommand {
         guard FileManager.default.fileExists(atPath: absURL(Parse.clipSpec(input).path).path) else {
             throw ReelError.message("No recording at \(Parse.clipSpec(input).path); run without --edit-only first")
         }
-        if let script = json["cursorScript"] {
+        // When act drove the real pointer, draw what was recorded so drawn and real can't drift.
+        let drawScript = json["act"] == nil || (json["cursorFrom"] as? String) == "script"
+        if json["cursorScript"] != nil && !drawScript {
+            log("Note: drawing the recorded pointer (act drove it); set \"cursorFrom\": \"script\" to draw the cursor script instead")
+        }
+        if drawScript, let script = json["cursorScript"] {
             if let path = script as? String { edit["cursorScript"] = path }
             else if JSONSerialization.isValidJSONObject(script) {
                 let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("reel-scene-\(getpid()).cursor.json")
@@ -723,6 +738,63 @@ struct Run: AsyncParsableCommand {
         guard edit["output"] != nil else { throw ReelError.message("\"edit\" needs an \"output\"") }
         var cmd = try Edit.parse([input] + (try SceneArgs.flags(edit, invertible: ["shadow", "clickEffect"])))
         try await cmd.run()
+    }
+}
+
+extension Run {
+    /// Records while performing the scene's "act" script with real input. Act starts once
+    /// the recording is armed (so its setup steps and start marker work), and stops the
+    /// recording when it ends if the record block has no stop condition of its own.
+    func recordWithAct(_ cmd: inout Record, rec: [String: Any], act: Any) async throws {
+        try Accessibility.require("A scene \"act\"")
+        let script: CursorScript
+        if let path = act as? String { script = try CursorScript.load(absURL(path)) }
+        else if JSONSerialization.isValidJSONObject(act) { script = try CursorScript.parse(try JSONSerialization.data(withJSONObject: act), name: "scene act") }
+        else { throw ReelError.message("\"act\" is a script file or an inline script") }
+        let hasStop = rec["duration"] != nil || rec["stopOn"] != nil || (rec["untilExit"] as? Bool) == true
+        let tail = (rec["tail"] as? NSNumber)?.doubleValue ?? 1.0
+        let recordDone = SharedBool()
+        let actTask = Task { () -> Result<ActResult, Error> in
+            // Wait for this process's recording to be armed.
+            while !recordDone.value {
+                if let st = try? RecordingState.current(), st.pid == getpid() { break }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if recordDone.value { return .failure(ReelError.message("The recording ended before act could start")) }
+            log("── act")
+            let result: Result<ActResult, Error>
+            do { result = .success(try await Actor.perform(ActOptions(script: script), log: log)) }
+            catch { result = .failure(error) }
+            var stop = !hasStop
+            if case .success(let r) = result, r.aborted != nil { stop = true }
+            if case .failure = result { stop = true }
+            if stop && !recordDone.value {
+                if case .success(let r) = result, r.aborted == nil { try? await Task.sleep(for: .seconds(tail)) }
+                kill(getpid(), SIGINT)   // ends the recording cleanly
+            }
+            return result
+        }
+        var recordError: Error?
+        do { try await cmd.run() } catch { recordError = error }
+        recordDone.value = true
+        switch await actTask.value {
+        case .success(let r):
+            try printJSON(r)
+            if let e = recordError { throw e }
+            if r.aborted != nil { throw ExitCode(2) }
+        case .failure(let e):
+            if let r = recordError { throw r }
+            throw ReelError.message("act: \(e.localizedDescription)")
+        }
+    }
+}
+
+final class SharedBool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = false
+    var value: Bool {
+        get { lock.withLock { v } }
+        set { lock.withLock { v = newValue } }
     }
 }
 
@@ -928,6 +1000,7 @@ struct Formats: ParsableCommand {
           {
             "version": 1,
             "captureRect": {"x","y","width","height"},  // captured area, screen points
+            "window": {"x","y","width","height"},       // the app window (= captureRect, or inside it for --display --app)
             "pointPixelScale": 2,                       // video pixels per point
             "samples": [{"t": 0.008, "x": 0.41, "y": 0.22, "down": false}, …],
                 // ~120/s. t = source seconds; x/y = 0–1 of the frame, top-left origin;
@@ -969,6 +1042,11 @@ struct Formats: ParsableCommand {
                 capture; if the recording waits on --start-on, act then sends that marker and
                 the steps follow the recording's clock. "setup": [] = send it right away.
           Coordinates: 0–1 of the captured frame, or strings "640pt" / "1280px".
+          {"coordinates": "window", "steps": [...]} makes them 0–1 of the app's window instead
+            (the sidecar "window" rect), so one script fits window and `--display --app` takes,
+            drawn or performed. Element targets are always found in the app window.
+          reel act without --now follows the recording's clock; if the recording is waiting
+            on --start-on, act waits for capture to start.
           Defaults: move "over" 0.6s, drag "over" 0.8s.
 
         PRESETS  read in order, later files winning field by field:
@@ -985,6 +1063,8 @@ struct Formats: ParsableCommand {
            "record": {<reel record flags, camelCase>,
                       "startOn": "ready", "stopOn": "done", "tail": 1.5, "timeout": 60},
            "cursorScript": "moves.json" | [steps…],
+           "act": "act.json" | {"steps": […]},   // performed with real input while recording
+           "cursorFrom": "script",                // with "act": draw cursorScript, not the recorded pointer
            "edit": {"trim": "1.2-22" | [1.2, 22], "input": "raw.mov", <reel edit flags>,
                     "cut": ["asked+1..answered-0.3"], "speed": ["a..b=6"], "patch": ["img.png@0,0"]},
            "teardown": ["shell command", …]}     // always runs, after quitAfter

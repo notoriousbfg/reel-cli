@@ -375,3 +375,96 @@ import Testing
         #expect(try plan(start).clips.count == 1)                           // a cut at the start is a trim
     }
 }
+
+import AVFoundation
+import CoreImage
+
+@Suite struct SmoothZoomTests {
+    /// A clip with frames only at `times` (like ScreenCaptureKit over a static window).
+    static func sparseClip(_ url: URL, times: [Double], w: Int = 320, h: Int = 200) async throws {
+        try? FileManager.default.removeItem(at: url)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h])
+        let ad = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h])
+        writer.add(input); writer.startWriting(); writer.startSession(atSourceTime: .zero)
+        // Detailed picture (checkerboard + gradient) so any zoom change moves pixels.
+        let checker = CIFilter(name: "CICheckerboardGenerator", parameters: ["inputWidth": 9, "inputColor0": CIColor.white, "inputColor1": CIColor.black])!.outputImage!
+        let grad = CIFilter(name: "CILinearGradient", parameters: ["inputPoint0": CIVector(x: 0, y: 0), "inputColor0": CIColor.red,
+                                                                   "inputPoint1": CIVector(x: CGFloat(w), y: CGFloat(h)), "inputColor1": CIColor.blue])!.outputImage!
+        let img = checker.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: grad]).cropped(to: CGRect(x: 0, y: 0, width: w, height: h))
+        let ctx = CIContext()
+        for t in times {
+            var pb: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, ad.pixelBufferPool!, &pb)
+            ctx.render(img, to: pb!)
+            while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(1)) }
+            ad.append(pb!, withPresentationTime: CMTime(seconds: t, preferredTimescale: 600))
+        }
+        input.markAsFinished()
+        writer.endSession(atSourceTime: CMTime(seconds: times.last! + 0.5, preferredTimescale: 600))
+        await writer.finishWriting()
+    }
+
+    /// Mean absolute difference between consecutive output frames in [from, to].
+    static func frameDiffs(_ url: URL, from: Double, to: Double) async throws -> (diffs: [Double], fps: Double) {
+        let asset = AVURLAsset(url: url)
+        let track = try await asset.loadTracks(withMediaType: .video).first!
+        let reader = try AVAssetReader(asset: asset)
+        let out = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        reader.add(out); reader.startReading()
+        var prev: [UInt8]?, diffs: [Double] = [], times: [Double] = []
+        while let sb = out.copyNextSampleBuffer() {
+            let t = CMSampleBufferGetPresentationTimeStamp(sb).seconds
+            times.append(t)
+            guard t >= from, t <= to, let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
+            CVPixelBufferLockBaseAddress(pb, .readOnly)
+            let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), bpr = CVPixelBufferGetBytesPerRow(pb)
+            let base = CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self)
+            var cur: [UInt8] = []
+            for y in stride(from: 0, to: h, by: 2) { for x in stride(from: 0, to: w, by: 2) { cur.append(base[y * bpr + x * 4 + 1]) } }
+            CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+            if let p = prev { diffs.append(Double(zip(p, cur).reduce(0) { $0 + abs(Int($1.0) - Int($1.1)) }) / Double(cur.count)) }
+            prev = cur
+        }
+        return (diffs, Double(times.count - 1) / ((times.last ?? 1) - (times.first ?? 0)))
+    }
+
+    @Test(arguments: [true, false]) func zoomOverStillClipChangesEveryFrame(hevc: Bool) async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("reel-smooth-\(getpid())-\(hevc ? "hevc" : "h264")")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let clip = dir.appendingPathComponent("still.mov"), out = dir.appendingPathComponent("zoom.mp4")
+        try await Self.sparseClip(clip, times: [0, 1.6, 2.8])            // 3 frames in 3.3s
+        var o = EditOptions()
+        o.inputs = [clip.path]; o.zooms = ["0.5-2.5:2@0.4,0.4"]; o.zoomEase = 0.6; o.fps = 60
+        let plan = try await Planner.plan(o)
+        try await Exporter.export(plan, to: out, hevc: hevc)
+        // Ease in (0.5–1.1s) and ease out (1.9–2.5s): every output frame must differ.
+        let (easeIn, fps) = try await Self.frameDiffs(out, from: 0.5 + 1.0 / 60, to: 1.1 - 1.0 / 60)
+        let (easeOut, _) = try await Self.frameDiffs(out, from: 1.9 + 1.0 / 60, to: 2.5 - 1.0 / 60)
+        #expect(abs(fps - 60) < 0.5)
+        #expect(easeIn.count >= 30 && easeOut.count >= 30)
+        #expect(easeIn.allSatisfy { $0 > 0.05 }, "identical frames during ease-in: \(easeIn.map { String(format: "%.2f", $0) })")
+        #expect(easeOut.allSatisfy { $0 > 0.05 }, "identical frames during ease-out: \(easeOut.map { String(format: "%.2f", $0) })")
+    }
+}
+
+@Suite struct WindowCoordinateTests {
+    @Test func windowCoordinatesMapIntoDisplayCapture() throws {
+        // Display capture 1000×800 pt at origin; app window at (200,100) 400×300.
+        var base = RecordingEvents(captureRect: .init(x: 0, y: 0, width: 1000, height: 800), pointPixelScale: 2, samples: [], cursorInVideo: false)
+        base.window = .init(x: 200, y: 100, width: 400, height: 300)
+        let json = #"{"coordinates": "window", "steps": [{"at": 0, "move": [0.5, 0.5]}, {"at": 1, "move": [1, 1], "over": 0.5}]}"#
+        let script = try CursorScript.parse(Data(json.utf8), name: "t")
+        let ev = try script.events(base: base, pointsSize: (1000, 800), pointPixelScale: 2, duration: 2)
+        let first = try #require(ev.samples.first), last = try #require(ev.samples.last)
+        #expect(abs(first.x - 0.4) < 1e-3 && abs(first.y - 0.3125) < 1e-3)    // (400,250)
+        #expect(abs(last.x - 0.6) < 1e-3 && abs(last.y - 0.5) < 1e-3)         // (600,400)
+        #expect(ev.window?.x == 200 && ev.window?.width == 400)
+    }
+
+    @Test func badCoordinatesValueRejected() {
+        #expect(throws: (any Error).self) { try CursorScript.parse(Data(#"{"coordinates": "screen", "steps": []}"#.utf8), name: "t") }
+    }
+}

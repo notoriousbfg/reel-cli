@@ -58,14 +58,37 @@ public enum Actor {
         func screen(_ p: (Double, Double)) -> CGPoint { CGPoint(x: wf.minX + p.0 * wf.width, y: wf.minY + p.1 * wf.height) }
         func now() -> Double { Date().timeIntervalSince1970 - clockStart }
 
-        if o.script.setup == nil, let state, !o.now {
-            if let t0 = state.t0 { clockStart = t0 }
+        if o.script.setup == nil, let st = state, !o.now {
+            if st.t0 == nil {
+                // The recording is waiting for its start marker: wait for capture, then
+                // follow its clock (the marker comes from the harness or `reel mark`).
+                if let label = st.startOn { log("Waiting for the recording to start (marker \"\(label)\")…") }
+                while true {
+                    guard let cur = try? RecordingState.current() else {
+                        throw ReelError.message("The recording ended before capture started")
+                    }
+                    if let t0 = cur.captureStartedAt { clockStart = t0; state = cur; break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                steps = try o.script.timeline(markers: o.script.markers(base: state?.readMarks() ?? []))
+            } else if let t0 = st.t0 { clockStart = t0 }
             if let first = steps.first, first.t < now() - 0.05 {
                 throw ReelError.message(String(format: "The recording is already at %.2fs but the script starts at %.2fs. Use --now to start the script clock now, or put the early steps under \"setup\".", now(), first.t))
             }
         }
 
-        let resolver = CursorScript.Resolver(width: wf.width, height: wf.height, scale: 1, element: { ref, _ in
+        // Point targets: 0–1 of the recorded frame (the window for window recordings), or of
+        // the app window with "coordinates": "window". Elements are always window-relative.
+        let cr = (o.script.windowCoordinates || o.pid != nil || o.windowID != nil) ? nil : state?.captureRect
+        let capture = cr.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) } ?? wf
+        func screenPoint(_ target: CursorScript.Target, _ t: Double, _ what: String) throws -> CGPoint {
+            let p = try resolver.point(target, at: t, what)
+            if case .point = target {
+                return CGPoint(x: capture.minX + p.0 * capture.width, y: capture.minY + p.1 * capture.height)
+            }
+            return screen(p)
+        }
+        let resolver = CursorScript.Resolver(width: capture.width, height: capture.height, scale: 1, element: { ref, _ in
             let found = Accessibility.find(try Accessibility.elements(in: window), label: ref.label, role: ref.role)
             guard found.indices.contains(ref.index ?? 0) else { throw ReelError.message("no element \"\(ref.label)\" on screen") }
             return CursorScript.Resolver.anchor(ref, in: found[ref.index ?? 0].frame)
@@ -136,12 +159,12 @@ public enum Actor {
                 try await wait(until: t - lead)
 
                 if let m = s.move {
-                    let p = screen(try resolver.point(m, at: t, "\(label) move"))
+                    let p = try screenPoint(m, t, "\(label) move")
                     try await glide(to: p, from: t - (s.over ?? CursorScript.defaultMove), to: t)
                 }
                 if let c = s.click {
                     if case .at(let target) = c {
-                        let p = screen(try resolver.point(target, at: t, "\(label) click"))
+                        let p = try screenPoint(target, t, "\(label) click")
                         try await glide(to: p, from: t - (s.over ?? 0.35), to: t)
                     }
                     try await wait(until: t)
@@ -154,7 +177,7 @@ public enum Actor {
                     }
                 }
                 if let d = s.drag {
-                    let pts = try d.map { screen(try resolver.point($0, at: t, "\(label) drag")) }
+                    let pts = try d.map { try screenPoint($0, t, "\(label) drag") }
                     guard pts.count >= 2 else { throw ReelError.message("\(label) drag needs at least two points") }
                     try await glide(to: pts[0], from: t - 0.35, to: t)
                     try await wait(until: t)
@@ -236,8 +259,13 @@ public enum Actor {
                         let now = fresh.readMarks()
                         marks = marks.map { m in now.first { $0.label == m.label } ?? m }
                     }
-                } else if let t0 = st.t0 {
-                    clockStart = t0
+                } else {
+                    // Armed but still setting up: wait for capture to begin.
+                    while true {
+                        guard let cur = try? RecordingState.current() else { throw ReelError.message("The recording ended before capture started") }
+                        if let t0 = cur.t0 { clockStart = t0; state = cur; break }
+                        try await Task.sleep(for: .milliseconds(10))
+                    }
                 }
                 steps = try o.script.timeline(markers: o.script.markers(base: (try? RecordingState.current())?.readMarks() ?? []))
                 if let first = steps.first, first.t < now() - 0.05 {
