@@ -278,3 +278,24 @@ import Testing
         #expect(ev.clicks.isEmpty && ev.sample(at: 3.5)!.x == 0.5)
     }
 }
+
+@Suite struct RecordingRobustnessTests {
+    @Test func markLines() throws {
+        #expect(try MarkLine.parse("open palette 1762862400.25")! == ("open palette", 1762862400.25))
+        #expect(try MarkLine.parse("saved\t12.5")! == ("saved", 12.5))
+        #expect(try MarkLine.parse("  # comment") == nil)
+        #expect(try MarkLine.parse("") == nil)
+        #expect(throws: (any Error).self) { try MarkLine.parse("no-time-here") }
+        #expect(throws: (any Error).self) { try MarkLine.parse("12.5") }
+    }
+
+    @Test func errorInfoKeepsDomainCodeAndChain() {
+        let inner = NSError(domain: "inner", code: 7, userInfo: [NSLocalizedDescriptionKey: "deep"])
+        let e = NSError(domain: "SCStreamErrorDomain", code: -3805,
+                        userInfo: [NSLocalizedDescriptionKey: "Unknown stream error", NSUnderlyingErrorKey: inner])
+        let info = ErrorInfo(e)
+        #expect(info.domain == "SCStreamErrorDomain" && info.code == -3805)
+        #expect(info.underlying == ["inner 7: deep"])
+        #expect(info.summary.contains("SCStreamErrorDomain -3805") && info.summary.contains("inner 7: deep"))
+    }
+}

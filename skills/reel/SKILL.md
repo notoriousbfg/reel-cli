@@ -61,6 +61,14 @@ When the app was driven by a harness (no real mouse), write a cursor script
 `"shape": "ibeam"` over text fields. Warnings about overlapping steps mean a move
 was delayed; fix the times.
 
+Markers from a sandboxed app: have it append `<label> <unix time>` lines to a file it can
+write, and pass `--marks-file <file>` to `reel record` (or `reel mark --import <file> --clip raw.mov`
+afterwards).
+
+Check the record JSON: `restarts`/`gaps` mean macOS stopped the stream and reel resumed it
+(a frame is held across each gap); exit code 3 means a `--duration` take ended short and
+`stoppedEarly`/`stopError` say why.
+
 Optional, needs Accessibility (`reel doctor` shows `accessibility`):
 - `reel locate --app X --label "Save" --role button` gives element centres for scripts and zooms.
 - `{"label": "Save"}` works anywhere a script takes `[x, y]`; record with `--ax-snapshots` so

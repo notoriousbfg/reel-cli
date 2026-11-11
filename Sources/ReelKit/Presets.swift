@@ -1,8 +1,8 @@
 import Foundation
 
 /// Named edit settings shared across a batch of clips. Read from
-/// ~/.config/reel/presets.json and ./reel.json (the project file wins, field by
-/// field). Either file is {"name": {...}} or {"presets": {"name": {...}}}.
+/// ~/.config/reel/presets.json and ./reel.json; under `reel run`, also reel.json
+/// beside the scene file (later files win, field by field). Either file is {"name": {...}} or {"presets": {"name": {...}}}.
 public struct Preset: Codable, Sendable, Equatable {
     public var padding: Double?
     public var background: String?
@@ -49,6 +49,14 @@ public enum Presets {
     public static var projectFile: URL {
         URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("reel.json")
     }
+    /// Project files searched after the user file, later ones winning. `reel run`
+    /// sets this to the working directory's reel.json and then the scene folder's.
+    nonisolated(unsafe) public static var projectFiles: [URL]? = nil
+
+    public static var searchFiles: [URL] {
+        var seen = Set<String>()
+        return ([userFile] + (projectFiles ?? [projectFile])).filter { seen.insert($0.standardizedFileURL.path).inserted }
+    }
 
     static func read(_ url: URL) throws -> [String: Preset] {
         guard let data = try? Data(contentsOf: url) else { return [:] }
@@ -63,7 +71,7 @@ public enum Presets {
 
     public static func all(files: [URL]? = nil) throws -> [String: Preset] {
         var out: [String: Preset] = [:]
-        for f in files ?? [userFile, projectFile] {
+        for f in files ?? searchFiles {
             for (name, p) in try read(f) { out[name] = (out[name] ?? Preset()).overlaid(by: p) }
         }
         return out
@@ -72,7 +80,7 @@ public enum Presets {
     public static func named(_ name: String, files: [URL]? = nil) throws -> Preset {
         let all = try all(files: files)
         guard let p = all[name] else {
-            let where_ = (files ?? [userFile, projectFile]).map(\.path).joined(separator: " or ")
+            let where_ = (files ?? searchFiles).map(\.path).joined(separator: " or ")
             throw ReelError.message("No preset '\(name)' in \(where_)" + (all.isEmpty ? "" : ". Available: \(all.keys.sorted().joined(separator: ", "))"))
         }
         return p

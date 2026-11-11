@@ -23,6 +23,9 @@ public struct RecordOptions: Sendable {
     public var untilExit = false       // stop when the recorded process quits
     public var quitAfter = false       // quit the recorded process when recording ends
     public var axSnapshots = false     // store labelled UI element frames at start and each marker (Accessibility)
+    public var cursorShapes = true     // note the on-screen cursor shape (I-beam, hand…) in the sidecar
+    public var marksFile: URL?         // watch this file for "<label> <unix time>" lines (sandboxed harnesses)
+    public var maxRestarts = 5         // restart capture this many times if macOS stops the stream
     public var openURL: String?        // URL/file to open in the app (e.g. localhost for web devs)
     public var windowTitle: String?    // substring match on window title
     public var windowID: UInt32?
@@ -53,8 +56,14 @@ public struct RecordResult: Codable, Sendable {
     public var pid: Int32?
     public var windowID: UInt32?
     public var markers: [RecordingEvents.Marker]?
-    /// Set when macOS ended the capture before it was asked to (e.g. the window closed).
+    /// Set when the recording ended before it was asked to (e.g. the window closed).
     public var stoppedEarly: String?
+    /// The error behind the last stream stop (domain, code, description).
+    public var stopError: ErrorInfo?
+    /// How many times capture was restarted after macOS stopped the stream.
+    public var restarts: Int?
+    /// Seconds with no new frames while capture restarted (held frame in the video).
+    public var gaps: [[Double]]?
     /// Set when --quit-after asked the app to quit.
     public var quit: Bool?
 }
@@ -99,12 +108,8 @@ public enum Windows {
     }
 }
 
-public final class Recorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate, @unchecked Sendable {
+public final class Recorder: @unchecked Sendable {
     private let opts: RecordOptions
-    private var started: CheckedContinuation<Void, Error>?
-    private var finished: CheckedContinuation<Void, Error>?
-    private var streamError: Error?
-    private var stopNow: (() -> Void)?
 
     public init(options: RecordOptions) { self.opts = options }
 
@@ -148,15 +153,12 @@ public final class Recorder: NSObject, SCRecordingOutputDelegate, SCStreamDelega
         config.queueDepth = 6
         config.capturesAudio = false
 
-        let recConfig = SCRecordingOutputConfiguration()
+        // Segments are written next to the output and joined (or renamed) at the end.
+        let dir = opts.output.deletingLastPathComponent()
+        let base = opts.output.deletingPathExtension().lastPathComponent
+        let ext = opts.output.pathExtension.isEmpty ? "mov" : opts.output.pathExtension
+        func partURL(_ n: Int) -> URL { dir.appendingPathComponent(".\(base).part\(n).\(ext)") }
         try? FileManager.default.removeItem(at: opts.output)
-        recConfig.outputURL = opts.output
-        recConfig.outputFileType = opts.output.pathExtension.lowercased() == "mp4" ? .mp4 : .mov
-        recConfig.videoCodecType = opts.hevc ? .hevc : .h264
-        let recording = SCRecordingOutput(configuration: recConfig, delegate: self)
-
-        let stream = SCStream(filter: filter, configuration: config, delegate: self)
-        try stream.addRecordingOutput(recording)
 
         if opts.countdown > 0 {
             var remaining = Int(opts.countdown.rounded(.up))
@@ -167,15 +169,12 @@ public final class Recorder: NSObject, SCRecordingOutputDelegate, SCStreamDelega
             }
         }
 
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            started = c
-            stream.startCapture { [weak self] err in
-                if let err { self?.resumeStart(err) }
-            }
-        }
+        var current = try CaptureSegment(filter: filter, config: config, url: partURL(0), hevc: opts.hevc)
+        try await current.start()
         let t0 = CACurrentMediaTime()
         let startedAt = Date().timeIntervalSince1970
-        let tracker = opts.trackCursor ? CursorTracker(captureRect: rect, start: t0) : nil
+        var parts: [(segment: CaptureSegment, offset: Double)] = [(current, 0)]
+        let tracker = opts.trackCursor ? CursorTracker(captureRect: rect, start: t0, shapes: opts.cursorShapes) : nil
         tracker?.start()
         log("Recording \(target.label) at \(width)×\(height) → \(opts.output.path)")
         log(opts.duration.map { "Stopping after \(String(format: "%.1f", $0))s (Ctrl-C to stop early)" }
@@ -194,27 +193,67 @@ public final class Recorder: NSObject, SCRecordingOutputDelegate, SCStreamDelega
                                   state: state, log: log)
             snapper?.start()
         }
-        await waitForStop(duration: opts.duration, exitOf: opts.untilExit ? targetPID : nil)
+        let marksWatcher = opts.marksFile.map { MarksFileWatcher(file: $0, state: state, log: log) }
+        marksWatcher?.start()
+
+        // Control loop: stop requests, duration, app exit, and stream stops (restart if we can).
+        let signals = StopSignals(exitOf: opts.untilExit ? targetPID : nil)
+        var lastError: ErrorInfo?
+        var endedEarly: ErrorInfo?
+        var restarts = 0
+        var gaps: [[Double]] = []
+        // Test hook: REEL_SIMULATE_STOP="2,5" stops the stream at those seconds.
+        var simulated = (ProcessInfo.processInfo.environment["REEL_SIMULATE_STOP"] ?? "")
+            .split(separator: ",").compactMap { Double($0) }.sorted()
+        while true {
+            let elapsed = CACurrentMediaTime() - t0
+            if let s = simulated.first, elapsed >= s, current.error == nil {
+                simulated.removeFirst()
+                await current.simulateStop()
+            }
+            if signals.requested || signals.appExited { break }
+            if let d = opts.duration, elapsed >= d { break }
+            if let err = current.error {
+                let info = ErrorInfo(err)
+                lastError = info
+                let gapStart = elapsed
+                log(String(format: "Capture stopped at %.2fs: %@", elapsed, info.summary))
+                _ = await current.waitFinished(timeout: 5)     // keep what it wrote
+                let remaining = opts.duration.map { $0 - (CACurrentMediaTime() - t0) } ?? .infinity
+                let windowAlive = await Self.windowExists(target.windowID)
+                if signals.appExited || signals.requested || remaining < 0.5 { break }
+                guard restarts < opts.maxRestarts, windowAlive else {
+                    endedEarly = info
+                    log(windowAlive ? "Giving up after \(restarts) restarts" : "The window is gone; ending the recording")
+                    break
+                }
+                do {
+                    let next = try CaptureSegment(filter: filter, config: config, url: partURL(parts.count), hevc: opts.hevc)
+                    try await next.start()
+                    let offset = CACurrentMediaTime() - t0
+                    current = next
+                    parts.append((next, offset))
+                    restarts += 1
+                    gaps.append([(gapStart * 1000).rounded() / 1000, (offset * 1000).rounded() / 1000])
+                    log(String(format: "Capture restarted at %.2fs (restart %d of %d)", offset, restarts, opts.maxRestarts))
+                } catch {
+                    endedEarly = ErrorInfo(error)
+                    log("Could not restart capture: \(endedEarly!.summary)")
+                    break
+                }
+                continue
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
         let elapsed = CACurrentMediaTime() - t0
+        await current.stop()
+        signals.cancel()
         tracker?.stop()
+        marksWatcher?.stop()
         let snapshots = snapper?.stop() ?? []
         let markers = state.collectMarks()
 
-        if let streamError {
-            // macOS already stopped the stream and finalised the file; stopCapture would fail.
-            if !(opts.untilExit && appExited) {
-                log("Capture stopped early: \(streamError.localizedDescription)")
-            }
-            if !FileManager.default.fileExists(atPath: opts.output.path) { throw streamError }
-        } else {
-            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-                finished = c
-                stream.stopCapture { [weak self] err in
-                    if let err { self?.resumeFinish(err) }
-                }
-            }
-        }
-
+        // --quit-after applies however the recording ended.
         var quit: Bool?
         if opts.quitAfter, let pid = targetPID, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated {
             let name = app.localizedName ?? "the app"
@@ -222,11 +261,29 @@ public final class Recorder: NSObject, SCRecordingOutputDelegate, SCStreamDelega
             if ok {
                 // terminate() only asks; wait for the process to go so the result is true to its word.
                 let deadline = Date().addingTimeInterval(5)
-                while !app.isTerminated && kill(pid, 0) == 0 && Date() < deadline { try await Task.sleep(for: .milliseconds(100)) }
+                while !app.isTerminated && kill(pid, 0) == 0 && Date() < deadline { try? await Task.sleep(for: .milliseconds(100)) }
                 ok = app.isTerminated || kill(pid, 0) != 0
             }
             quit = ok
             log(ok ? "Quit \(name)" : "\(name) did not quit (it may be showing a dialog)")
+        }
+
+        // Finalise: one segment is renamed into place; several are joined on the t=0 timeline.
+        let written = parts.filter { FileManager.default.fileExists(atPath: $0.segment.url.path) }
+        if written.isEmpty {
+            throw ReelError.message("No video was written" + (lastError.map { ": \($0.summary)" } ?? ""))
+        }
+        if written.count == 1 && written[0].offset == 0 {
+            try FileManager.default.moveItem(at: written[0].segment.url, to: opts.output)
+        } else {
+            log("Joining \(written.count) segments…")
+            do {
+                try await SegmentJoiner.join(written.map { ($0.segment.url, $0.offset) }, to: opts.output)
+                for p in written { try? FileManager.default.removeItem(at: p.segment.url) }
+            } catch {
+                throw ReelError.message("Could not join segments (\(ErrorInfo(error).summary)). They are kept: "
+                                        + written.map(\.segment.url.path).joined(separator: ", "))
+            }
         }
 
         var eventsPath: String?
@@ -242,11 +299,19 @@ public final class Recorder: NSObject, SCRecordingOutputDelegate, SCStreamDelega
             eventsPath = RecordingEvents.sidecarURL(for: opts.output).path
         }
         // An app quitting under --until-exit is the expected way to finish.
-        let early = (opts.untilExit && appExited) ? nil : streamError?.localizedDescription
+        if opts.untilExit && signals.appExited { endedEarly = nil }
+        if let endedEarly { log("Capture stopped early: \(endedEarly.summary)") }
         return RecordResult(output: opts.output.path, events: eventsPath, width: width, height: height,
                             duration: elapsed, app: opts.app, windowTitle: target.title, pid: targetPID,
                             windowID: target.windowID, markers: markers.isEmpty ? nil : markers,
-                            stoppedEarly: early, quit: quit)
+                            stoppedEarly: endedEarly?.summary, stopError: lastError,
+                            restarts: restarts > 0 ? restarts : nil, gaps: gaps.isEmpty ? nil : gaps, quit: quit)
+    }
+
+    static func windowExists(_ id: UInt32?) async -> Bool {
+        guard let id else { return true }   // display capture
+        guard let content = try? await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false) else { return true }
+        return content.windows.contains { $0.windowID == id }
     }
 
     // MARK: - Target resolution
@@ -409,76 +474,90 @@ public final class Recorder: NSObject, SCRecordingOutputDelegate, SCStreamDelega
         }
     }
 
-    // MARK: - Stop handling
+}
 
-    private var appExited = false
+/// Ctrl-C, SIGTERM (`reel stop`) and, with --until-exit, the app quitting.
+final class StopSignals: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _requested = false, _appExited = false
+    private var sources: [DispatchSourceProtocol] = []
+    var requested: Bool { lock.withLock { _requested } }
+    var appExited: Bool { lock.withLock { _appExited } }
 
-    private func waitForStop(duration: Double?, exitOf pid: Int32?) async {
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            let once = OnceFlag()
-            let fire = { if once.claim() { c.resume() } }
-            stopNow = fire
-            var sources: [DispatchSourceProtocol] = []
-            for sig in [SIGINT, SIGTERM] {
-                signal(sig, SIG_IGN)
-                let s = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-                s.setEventHandler { fire() }
-                s.resume()
-                sources.append(s)
-            }
-            if let pid {
-                let p = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
-                p.setEventHandler { [weak self] in self?.appExited = true; fire() }
-                p.resume()
-                sources.append(p)
-                if kill(pid, 0) != 0 { appExited = true; fire() }
-            }
-            if let duration {
-                DispatchQueue.main.asyncAfter(deadline: .now() + duration) { fire() }
-            }
-            // Keep sources alive until the process exits.
-            SignalHolder.shared.sources = sources
+    init(exitOf pid: Int32?) {
+        for sig in [SIGINT, SIGTERM] {
+            signal(sig, SIG_IGN)
+            let s = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+            s.setEventHandler { [weak self] in self?.lock.withLock { self?._requested = true } }
+            s.resume()
+            sources.append(s)
+        }
+        if let pid {
+            let p = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .global())
+            p.setEventHandler { [weak self] in self?.lock.withLock { self?._appExited = true } }
+            p.resume()
+            sources.append(p)
+            if kill(pid, 0) != 0 { _appExited = true }
         }
     }
 
-    private func resumeStart(_ error: Error?) {
-        guard let c = started else { return }
-        started = nil
-        if let error { c.resume(throwing: error) } else { c.resume() }
+    func cancel() { for s in sources { s.cancel() } }
+}
+
+/// Watches a file a sandboxed harness can write to: lines of "<label> <unix time>".
+final class MarksFileWatcher: @unchecked Sendable {
+    private let file: URL
+    private let state: RecordingState
+    private let log: (String) -> Void
+    private let queue = DispatchQueue(label: "reel.marks")
+    private var timer: DispatchSourceTimer?
+    private var consumed = 0
+
+    init(file: URL, state: RecordingState, log: @escaping (String) -> Void) {
+        self.file = file; self.state = state; self.log = log
+        // Only lines written after the recording starts count.
+        consumed = (try? Data(contentsOf: file).count) ?? 0
     }
 
-    private func resumeFinish(_ error: Error?) {
-        guard let c = finished else { return }
-        finished = nil
-        if let error { c.resume(throwing: error) } else { c.resume() }
+    func start() {
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now(), repeating: .milliseconds(100))
+        t.setEventHandler { [weak self] in self?.poll() }
+        t.resume()
+        timer = t
     }
 
-    // MARK: - Delegates
+    func stop() { queue.sync { timer?.cancel(); timer = nil; poll() } }
 
-    public func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) { resumeStart(nil) }
-    public func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) { resumeFinish(nil) }
-    public func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: Error) {
-        streamError = error
-        resumeStart(error)
-        resumeFinish(error)
-    }
-    public func stream(_ stream: SCStream, didStopWithError error: Error) {
-        streamError = error
-        resumeStart(error)
-        resumeFinish(error)
-        stopNow?()
+    private func poll() {
+        guard let data = try? Data(contentsOf: file), data.count > consumed else { return }
+        let chunk = data[consumed...]
+        // Only complete lines; a half-written last line waits for the next poll.
+        guard let lastNL = chunk.lastIndex(of: 0x0A) else { return }
+        let text = String(decoding: data[consumed...lastNL], as: UTF8.self)
+        consumed = lastNL + 1
+        for line in text.split(separator: "\n") {
+            do {
+                guard let (label, unix) = try MarkLine.parse(String(line)) else { continue }
+                try state.append(.init(label: label, t: ((unix - state.startedAt) * 1000).rounded() / 1000))
+            } catch { log("warning: marks file: \(error.localizedDescription)") }
+        }
     }
 }
 
-private final class OnceFlag: @unchecked Sendable {
-    private var done = false
-    private let lock = NSLock()
-    func claim() -> Bool { lock.lock(); defer { lock.unlock() }; if done { return false }; done = true; return true }
-}
-
-private final class SignalHolder: @unchecked Sendable {
-    static let shared = SignalHolder()
-    var sources: [DispatchSourceProtocol] = []
+/// "<label> <unix time>" (label may contain spaces; # comments and blank lines skipped).
+public enum MarkLine {
+    public static func parse(_ line: String) throws -> (String, Double)? {
+        let s = line.trimmingCharacters(in: .whitespaces)
+        if s.isEmpty || s.hasPrefix("#") { return nil }
+        guard let sp = s.lastIndex(where: { $0 == " " || $0 == "\t" }),
+              let t = Double(s[s.index(after: sp)...]) else {
+            throw ReelError.message("expected \"<label> <unix time>\", got \"\(s)\"")
+        }
+        let label = s[..<sp].trimmingCharacters(in: .whitespaces)
+        guard !label.isEmpty else { throw ReelError.message("missing label in \"\(s)\"") }
+        return (label, t)
+    }
 }
 
 /// Polls cursor position and button state. Reading this state needs no
@@ -490,15 +569,14 @@ final class CursorTracker: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private(set) var samples: [RecordingEvents.CursorSample] = []
     private(set) var shapes: [RecordingEvents.ShapeChange] = []
-    private var tick = 0
-    /// (hotspot, size) of each system cursor, used to recognise the cursor on screen.
-    private let signatures: [(CursorShape, CGPoint, CGSize)] = CursorShape.allCases.map {
-        let c = CursorSprite.nsCursor($0); return ($0, c.hotSpot, c.image.size)
-    }
 
-    init(captureRect: CGRect, start: CFTimeInterval) {
+    private let trackShapes: Bool
+    private var shapeTimer: DispatchSourceTimer?
+
+    init(captureRect: CGRect, start: CFTimeInterval, shapes: Bool = true) {
         self.rect = captureRect
         self.t0 = start
+        self.trackShapes = shapes
     }
 
     func start() {
@@ -507,24 +585,39 @@ final class CursorTracker: @unchecked Sendable {
         t.setEventHandler { [weak self] in self?.sample() }
         t.resume()
         timer = t
+        guard trackShapes else { return }
+        // NSCursor is AppKit: query it on the main thread only, ~10× a second.
+        let s = DispatchSource.makeTimerSource(queue: .main)
+        s.schedule(deadline: .now(), repeating: .milliseconds(100))
+        s.setEventHandler { [weak self] in autoreleasepool { self?.sampleShape() } }
+        s.resume()
+        shapeTimer = s
     }
 
-    func stop() { queue.sync { timer?.cancel(); timer = nil } }
+    func stop() {
+        shapeTimer?.cancel(); shapeTimer = nil
+        queue.sync { timer?.cancel(); timer = nil }
+    }
+
+    private lazy var signatures: [(CursorShape, CGPoint, CGSize)] = CursorShape.allCases.map {
+        let c = CursorSprite.nsCursor($0); return ($0, c.hotSpot, c.image.size)
+    }
+
+    private func sampleShape() {
+        guard let c = NSCursor.currentSystem else { return }
+        let t = ((CACurrentMediaTime() - t0) * 10000).rounded() / 10000
+        let hs = c.hotSpot, size = c.image.size
+        guard let match = signatures.first(where: { $0.1 == hs && $0.2 == size })?.0 else { return }
+        queue.async {
+            if match != (self.shapes.last?.shape ?? .arrow) { self.shapes.append(.init(t: t, shape: match)) }
+        }
+    }
 
     private func sample() {
         guard let loc = CGEvent(source: nil)?.location else { return }  // global, top-left origin
         let down = CGEventSource.buttonState(.combinedSessionState, button: .left)
         let r = { (v: Double) in (v * 10000).rounded() / 10000 }
         let t = r(CACurrentMediaTime() - t0)
-        tick += 1
-        // The shape on screen (I-beam over text, hand over links), checked ~20× a second.
-        if tick % 6 == 1, let c = NSCursor.currentSystem {
-            let hs = c.hotSpot, size = c.image.size
-            if let match = signatures.first(where: { $0.1 == hs && $0.2 == size })?.0,
-               match != (shapes.last?.shape ?? .arrow) || (shapes.isEmpty && match != .arrow) {
-                shapes.append(.init(t: t, shape: match))
-            }
-        }
         samples.append(.init(t: t,
                              x: r((loc.x - rect.minX) / rect.width),
                              y: r((loc.y - rect.minY) / rect.height),
@@ -577,6 +670,12 @@ public struct RecordingState: Codable, Sendable {
     /// Appends a marker at the current moment of the running recording.
     public func mark(_ label: String, offset: Double = 0) throws -> RecordingEvents.Marker {
         let m = RecordingEvents.Marker(label: label, t: ((Date().timeIntervalSince1970 - startedAt + offset) * 1000).rounded() / 1000)
+        try append(m)
+        return m
+    }
+
+    /// Appends a marker with an explicit time (e.g. from a marks file).
+    public func append(_ m: RecordingEvents.Marker) throws {
         var line = try JSONEncoder().encode(m)
         line.append(0x0A)
         if let h = try? FileHandle(forWritingTo: marksURL) {
@@ -586,7 +685,6 @@ public struct RecordingState: Codable, Sendable {
         } else {
             try line.write(to: marksURL)
         }
-        return m
     }
 
     /// Markers so far (leaves them in place).

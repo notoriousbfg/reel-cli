@@ -42,7 +42,7 @@ struct Reel: AsyncParsableCommand {
             `locate`, `act` and `record --ax-snapshots` also need Accessibility.
             File formats (events sidecar, cursor scripts, presets, scenes): reel help formats
             """,
-        version: "0.2.0",
+        version: "0.2.1",
         subcommands: [Record.self, Stop.self, Mark.self, Windows.self, Edit.self, Run.self, Cursor.self,
                       Changes.self, Info.self, Frame.self, Sheet.self, Locate.self, Act.self, Doctor.self, Formats.self]
     )
@@ -101,6 +101,12 @@ struct Record: AsyncParsableCommand {
     var quitAfter = false
     @Flag(help: "Store labelled UI element frames at the start and at each `reel mark`, so cursor scripts can target {\"label\": …}. Needs Accessibility.")
     var axSnapshots = false
+    @Option(help: "Watch this file for markers: lines of \"<label> <unix time>\" (for harnesses in a sandbox that can't run `reel mark`).")
+    var marksFile: String?
+    @Flag(help: "Don't note the on-screen cursor shape (I-beam, hand…) in the sidecar.")
+    var noCursorShapes = false
+    @Option(help: "Restart capture up to this many times if macOS stops the stream.")
+    var maxRestarts = 5
     @Option(help: "Seconds to count down before recording.")
     var countdown: Double = 0
     @Option(help: "Frames per second.")
@@ -121,6 +127,7 @@ struct Record: AsyncParsableCommand {
         o.app = app; o.pid = pid; o.launch = launch; o.newInstance = newInstance
         o.background = background; o.openURL = openURL
         o.untilExit = untilExit; o.quitAfter = quitAfter; o.axSnapshots = axSnapshots
+        o.marksFile = marksFile.map(absURL); o.cursorShapes = !noCursorShapes; o.maxRestarts = max(0, maxRestarts)
         for e in env {
             guard let eq = e.firstIndex(of: "="), eq != e.startIndex else { throw ReelError.message("--env expects KEY=VALUE (got \(e))") }
             o.environment[String(e[..<eq])] = String(e[e.index(after: eq)...])
@@ -135,6 +142,11 @@ struct Record: AsyncParsableCommand {
         }
         let result = try await Recorder(options: o).run(log: log)
         try printJSON(result)
+        // A --duration take that ended short is a failure, even though the file is usable.
+        if let duration, result.duration < duration - 0.25 {
+            log(String(format: "Recording is %.2fs of the requested %.2fs", result.duration, duration))
+            throw ExitCode(3)
+        }
     }
 }
 
@@ -157,9 +169,16 @@ struct Mark: ParsableCommand {
             --zoom open-palette..close-palette:1.7@0.5,0.3
 
             To add one after the fact: reel mark intro --clip raw.mov --at 2.5
+
+            A sandboxed app can't run reel, so let it append "<label> <unix time>" lines
+            to a file instead: watch it live with `reel record --marks-file <file>`, or
+            import it afterwards with `reel mark --import <file> --clip raw.mov` (times
+            are placed using the sidecar's startedAt).
             """)
     @Argument(help: "Marker name (letters, digits, - and _ read best in time references).")
-    var label: String
+    var label: String?
+    @Option(help: "Import markers from a file of \"<label> <unix time>\" lines (needs --clip).")
+    var `import`: String?
     @Option(parsing: .unconditional, help: "Shift the marker by this many seconds (e.g. -0.2 when the call comes just after the action).")
     var offset: Double = 0
     @Option(help: "Add to this clip's sidecar instead of the running recording.")
@@ -168,6 +187,34 @@ struct Mark: ParsableCommand {
     var at: Double?
 
     func run() throws {
+        if let file = `import` {
+            guard let clip else { throw ReelError.message("--import needs --clip <recording>") }
+            let url = absURL(clip)
+            var ev = try RecordingEvents.read(RecordingEvents.sidecarURL(for: url))
+            guard let startedAt = ev.startedAt else {
+                throw ReelError.message("\(url.lastPathComponent)'s sidecar has no startedAt (recorded before reel 0.2), so Unix times can't be placed")
+            }
+            guard let text = try? String(contentsOf: absURL(file), encoding: .utf8) else { throw ReelError.message("Cannot read \(file)") }
+            var added: [RecordingEvents.Marker] = []
+            for (n, line) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                do {
+                    guard let (label, unix) = try MarkLine.parse(String(line)) else { continue }
+                    added.append(.init(label: label, t: ((unix - startedAt + offset) * 1000).rounded() / 1000))
+                } catch { throw ReelError.message("\(file) line \(n + 1): \(error.localizedDescription)") }
+            }
+            let duration = ev.samples.last?.t ?? .infinity
+            for m in added where m.t < 0 || m.t > duration {
+                log(String(format: "warning: marker %@ at %.2fs is outside the recording (0–%.2fs)", m.label, m.t, duration))
+            }
+            // Re-importing replaces markers with the same label and time.
+            var markers = (ev.markers ?? []).filter { m in !added.contains { $0.label == m.label && abs($0.t - m.t) < 0.0005 } }
+            markers += added
+            ev.markers = markers.sorted { $0.t < $1.t }
+            try ev.write(for: url)
+            try printJSON(added)
+            return
+        }
+        guard let label else { throw ReelError.message("Give a marker name, or --import <file> --clip <recording>") }
         guard !label.isEmpty, Double(label) == nil else { throw ReelError.message("Marker names can't be plain numbers") }
         if let clip {
             guard let at else { throw ReelError.message("--clip needs --at SECONDS") }
@@ -250,7 +297,7 @@ struct Edit: AsyncParsableCommand {
     var clips: [String]
     @Option(name: .shortAndLong, help: "Output video (.mp4/.mov), or .png with --preview-at / --preview-sheet.")
     var output: String
-    @Option(help: "Named settings from ~/.config/reel/presets.json or ./reel.json. Flags override it.")
+    @Option(help: "Named settings from ~/.config/reel/presets.json or ./reel.json (and, under `reel run`, reel.json beside the scene). Flags override it.")
     var preset: String?
     @Option(parsing: .singleValue, help: "Crop x,y,w,h in source px (or %). Repeatable; N= for one clip.")
     var crop: [String] = []
@@ -437,7 +484,9 @@ struct Run: AsyncParsableCommand {
             }
             Keys are the long flags of `reel record` / `reel edit` in camelCase. Lists
             repeat a flag; true sets a flag; false sets --no-… where one exists.
-            Paths are relative to the scene file.
+            Paths are relative to the scene file. Presets come from ~/.config/reel/presets.json,
+            then reel.json in the working directory, then reel.json beside the scene file
+            (later files win, field by field).
             """)
     @Argument(help: "Scene JSON file.")
     var scene: String
@@ -459,7 +508,10 @@ struct Run: AsyncParsableCommand {
         let unknown = Set(json.keys).subtracting(["record", "edit", "cursorScript", "name", "notes"])
         if !unknown.isEmpty { throw ReelError.message("Unknown scene keys: \(unknown.sorted().joined(separator: ", "))") }
         let previewURL = preview.map(absURL)
-        FileManager.default.changeCurrentDirectoryPath(url.deletingLastPathComponent().path)
+        // Presets: ./reel.json in the working directory, then reel.json beside the scene.
+        let sceneDir = url.deletingLastPathComponent()
+        Presets.projectFiles = [Presets.projectFile, sceneDir.appendingPathComponent("reel.json")]
+        FileManager.default.changeCurrentDirectoryPath(sceneDir.path)
 
         let rec = json["record"] as? [String: Any]
         let recOutput = rec?["output"] as? String ?? "recording.mov"
@@ -635,7 +687,7 @@ struct Formats: ParsableCommand {
                 // ~120/s. t = source seconds; x/y = 0–1 of the frame, top-left origin;
                 // outside 0–1 = pointer not over the capture. down = left button held.
             "shapes": [{"t": 3.2, "shape": "ibeam"}],   // arrow|ibeam|hand|crosshair (arrow before first)
-            "markers": [{"label": "open-palette", "t": 4.1}],
+            "markers": [{"label": "open-palette", "t": 4.1}],   // reel mark, --marks-file, mark --import
             "snapshots": [{"t": 4.1, "marker": "open-palette", "elements": [
                 {"role": "AXButton", "label": "Highlight", "frame": {…}, "center": [x, y], …}]}],
                 // record --ax-snapshots: at t=0 and each marker; frames are 0–1 of the window
@@ -666,7 +718,9 @@ struct Formats: ParsableCommand {
           Coordinates: 0–1 of the captured frame, or strings "640pt" / "1280px".
           Defaults: move "over" 0.6s, drag "over" 0.8s.
 
-        PRESETS  (~/.config/reel/presets.json, ./reel.json; the project file wins per field)
+        PRESETS  read in order, later files winning field by field:
+          ~/.config/reel/presets.json, then ./reel.json (working directory),
+          then, under `reel run`, reel.json beside the scene file.
           {"promo": {"padding": 96, "background": "#1d2b64,#f8cdda", "cornerRadius": 24,
                      "shadow": true, "size": "1920x1080", "cursor": 1.8, "clickEffect": true,
                      "fadeIn": 0.4, "fadeOut": 0.6, "fps": 60, "codec": "h264",

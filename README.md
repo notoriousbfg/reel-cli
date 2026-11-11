@@ -50,6 +50,8 @@ reel record --app Safari --open http://localhost:3000 -o site.mov          # web
 reel record --app build/Debug/Grasmere.app --new-instance --env DEMO=1 \
   --args "-AppleLanguages (en)" --until-exit --quit-after -o raw.mov       # driven by a test harness
 reel mark saved                          # from the harness, while recording
+reel record … --marks-file marks.txt     # sandboxed harness: it appends "<label> <unix time>" lines
+reel mark --import marks.txt --clip raw.mov   # …or import them afterwards
 
 # 2. Look at it
 reel info raw.mov                        # duration, size, clicks, markers (JSON)
@@ -68,6 +70,13 @@ reel edit raw.mov:1.2-22 … -o promo.mp4
 reel run scene.json                      # record + edit
 reel run scene.json --edit-only --preview check.png
 ```
+
+If macOS stops the capture stream mid-take, `record` restarts it (up to
+`--max-restarts`, default 5) and joins the pieces on the original timeline,
+holding a frame across each short gap. The JSON reports `restarts`, `gaps` and
+`stopError` (domain, code, description). A `--duration` take that still ends
+short exits with code 3; the file is always finalised and `--quit-after` still
+applies.
 
 `reel help formats` documents every JSON file: the events sidecar, cursor
 scripts, presets and scene files.
@@ -92,7 +101,7 @@ scripts, presets and scene files.
 | `--cursor SCALE` | draw the real macOS cursor (arrow, I-beam, hand, crosshair) from the events, smoothly, with a halo on clicks (`--no-click-effect`). Record with `--no-cursor` so it isn't doubled |
 | `--cursor-script moves.json` | author the cursor track instead of recording it (moves, clicks, drags, shapes; times can name markers) |
 | `--events file.json` | use another events file; the recorded sidecar is never modified |
-| `--preset NAME` | settings from `~/.config/reel/presets.json` or `./reel.json`; flags override |
+| `--preset NAME` | settings from `~/.config/reel/presets.json`, then `./reel.json`, then (under `reel run`) `reel.json` beside the scene; later files win per field, flags override |
 | `--fade-in --fade-out` | to/from black |
 | `--codec hevc\|h264` | output codec (default hevc) |
 | `--preview-at T[,T…]` / `--preview-sheet` | render PNG(s) of the edit instead of exporting |
