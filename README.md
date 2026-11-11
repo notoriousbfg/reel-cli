@@ -28,9 +28,10 @@ capture also keeps other apps out of frame. If you'd rather not grant Screen
 Recording at all, record with ⌘⇧5 and use `reel` purely for editing (you lose
 the click data that powers `--auto-zoom` and `@cursor`).
 
-While recording, macOS shows a purple capture pill in place of the window's traffic
-lights. Crop past the title bar with `--crop 0,56,<width>,<height − 56>` (sizes from `reel info`)
-if you don't want it in shot.
+While recording, macOS shows a purple "being shared" pill in place of the window's
+traffic lights. Record with `--clean-titlebar` and reel stores a still of that corner
+(taken before capture, and again after any restart); `reel edit` draws it back over
+the pill automatically. Or crop past the title bar.
 
 ## Install
 
@@ -76,8 +77,8 @@ reel run scene.json --edit-only --preview check.png
 
 If macOS stops the capture stream mid-take, `record` restarts it (up to
 `--max-restarts`, default 5) and joins the pieces on the original timeline,
-holding a frame across each short gap. The JSON reports `restarts`, `gaps` and
-`stopError` (domain, code, description). A `--duration` take that still ends
+holding a frame across each short gap. The JSON reports `restarts`, `lostSeconds`, `gaps`
+and `stopError` (domain, code, description), so a take can be rejected. A `--duration` take that still ends
 short exits with code 3; the file is always finalised and `--quit-after` still
 applies.
 
@@ -106,6 +107,9 @@ scripts, presets and scene files.
 | `--zoom-ease SEC` | ease in/out time (default 0.6). Zooms that touch pan instead of zooming out |
 | `--transition KIND[:SEC]` | `cut crossfade fade slide-left/right/up/down wipe zoom`; `N=` targets join N |
 | `--speed X` | playback speed; `N=` targets clip N |
+| `--speed A..B=6` | play a source stretch faster, e.g. `asked+1..answered-0.3=6` (a model thinking) |
+| `--cut A..B` | remove a source stretch (seconds or markers), crossfading `--cut-fade` (0.3s) across the join. Cursor, clicks, markers and `src:` zooms after it still line up |
+| `--patch IMG@x,y[,w,h][:S-E]` | draw an image over source pixels before crop/zoom (`--no-recorded-patches` skips `--clean-titlebar` ones) |
 | `--size WxH` | output canvas (default: cropped size + padding) |
 | `--padding --background --corner-radius --shadow` | promo-style framing; two colors = gradient |
 | `--cursor SCALE` | draw the real macOS cursor (arrow, I-beam, hand, crosshair) from the events, smoothly, with a halo on clicks (`--no-click-effect`). Record with `--no-cursor` so it isn't doubled |

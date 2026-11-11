@@ -67,6 +67,11 @@ take whose marker never comes (exit 1 before capture, 4 after). Put pre-roll act
 an act script's `"setup"` list. Scenes take `"prepare"`/`"teardown"` commands and
 `${VAR}`s; `{"shot": {...}}` (or `reel shot`) makes a still instead of a video.
 
+Record with `--clean-titlebar` so the purple sharing pill never shows in edits. Skip dead
+time by marker: `--cut asked+1..answered-0.3` or `--speed asked+1..answered-0.3=6`; times
+after it (markers, cursor, src: zooms) still line up. Reject takes whose record JSON shows
+too much `lostSeconds`.
+
 Markers from a sandboxed app: have it append `<label> <unix time>` lines to a file it can
 write, and pass `--marks-file <file>` to `reel record` (or `reel mark --import <file> --clip raw.mov`
 afterwards).

@@ -26,6 +26,10 @@ public struct EditOptions: Sendable {
     public var clickEffect = true
     public var events: [String] = []        // "file.json" or "N=file.json"
     public var cursorScripts: [String] = [] // "moves.json" or "N=moves.json"
+    public var patches: [String] = []       // "img.png@x,y[,w,h][:S-E]", optional N=
+    public var cuts: [String] = []          // "A..B" (seconds or markers), optional N=
+    public var cutFade = 0.3                // crossfade across each cut (0 = hard cut)
+    public var recordedPatches = true       // apply patches stored in the sidecar
     public init() {}
 }
 
@@ -36,6 +40,7 @@ public enum Planner {
         // NSCursor images (for --cursor) only render once AppKit has a window-server session.
         if o.cursor != nil { await AppKitSession.ensure() }
         var clips: [EditPlan.Clip] = []
+        var internalJoins: [Int: EditPlan.Transition] = [:]
         for (n, spec) in o.inputs.enumerated() {
             let (path, start, end) = Parse.clipSpec(spec)
             let url = URL(fileURLWithPath: path)
@@ -57,6 +62,7 @@ public enum Planner {
             var speed = 1.0
             for s in o.speeds {
                 let (idx, v) = Parse.indexed(s)
+                if v.contains("..") { continue }   // a speed range, applied below
                 guard let x = Double(v), x > 0 else { throw ReelError.message("Bad --speed \(s)") }
                 if idx == nil || idx == n + 1 { speed = x }
             }
@@ -72,17 +78,28 @@ public enum Planner {
                 if idx == nil || idx == n + 1 { clip.cursorScript = v }
             }
             let scriptName = clip.cursorScript.map { ($0 as NSString).lastPathComponent } ?? ""
-            clip.hasEvents = try clip.loadEvents(warn: {
+            let events = try clip.loadEvents(warn: {
                 FileHandle.standardError.write(Data("warning: \(scriptName): \($0)\n".utf8))
-            }) != nil
-            clips.append(clip)
+            })
+            clip.hasEvents = events != nil
+            clip.input = n
+            clip.patches = try patches(for: clip, n: n, o)
+            let pieces = try split(clip, n: n, markers: events?.markers ?? [], o)
+            for (k, piece) in pieces.enumerated() {
+                clips.append(piece.clip)
+                if k > 0 { internalJoins[clips.count - 2] = piece.join }
+            }
         }
 
+        // Joins between input clips take --transition; joins inside a clip (cuts,
+        // speed changes) were set by split().
         var transitions = Array(repeating: EditPlan.Transition(kind: .cut, duration: 0), count: max(0, clips.count - 1))
-        for t in o.transitions {
-            let (idx, v) = Parse.indexed(t)
-            let tr = try Parse.transition(v)
-            for i in transitions.indices where idx == nil || idx == i + 1 { transitions[i] = tr }
+        for i in transitions.indices {
+            if let j = internalJoins[i] { transitions[i] = j; continue }
+            for t in o.transitions {
+                let (idx, v) = Parse.indexed(t)
+                if idx == nil || idx == clips[i].input + 1 { transitions[i] = try Parse.transition(v) }
+            }
         }
         for i in transitions.indices {
             let limit = min(clips[i].duration, clips[i + 1].duration) / 2
@@ -131,34 +148,123 @@ public enum Planner {
 
     public static let maxFitScale = 3.0
 
+    /// Patches for input clip `n`: from the sidecar (record --clean-titlebar) and --patch.
+    static func patches(for clip: EditPlan.Clip, n: Int, _ o: EditOptions) throws -> [RecordingEvents.Patch] {
+        var out: [RecordingEvents.Patch] = []
+        if o.recordedPatches {
+            let file = clip.eventsPath.map { URL(fileURLWithPath: $0) } ?? RecordingEvents.sidecarURL(for: URL(fileURLWithPath: clip.path))
+            if let ev = try? RecordingEvents.read(file) {
+                for var p in ev.patches ?? [] {
+                    if !p.image.hasPrefix("/") { p.image = file.deletingLastPathComponent().appendingPathComponent(p.image).path }
+                    guard FileManager.default.fileExists(atPath: p.image) else {
+                        FileHandle.standardError.write(Data("warning: recorded patch \(p.image) is missing; skipped\n".utf8))
+                        continue
+                    }
+                    out.append(p)
+                }
+            }
+        }
+        for spec in o.patches {
+            let (idx, v) = Parse.indexed(spec)
+            guard idx == nil || idx == n + 1 else { continue }
+            var p = try Parse.patch(v)
+            p.image = URL(fileURLWithPath: (p.image as NSString).expandingTildeInPath).standardizedFileURL.path
+            guard let img = CIImage(contentsOf: URL(fileURLWithPath: p.image)) else {
+                throw ReelError.message("--patch: cannot read image \(p.image)")
+            }
+            if p.width < 0 { p.width = img.extent.width; p.height = img.extent.height }
+            out.append(p)
+        }
+        return out
+    }
+
+    /// Splits an input clip at --cut and ranged --speed stretches into consecutive
+    /// clips of the same file. Each piece keeps source time, so cursor, clicks,
+    /// markers and src: zooms land on the right frames after the edit.
+    static func split(_ clip: EditPlan.Clip, n: Int, markers: [RecordingEvents.Marker], _ o: EditOptions)
+        throws -> [(clip: EditPlan.Clip, join: EditPlan.Transition)] {
+        struct Op { var a, b: Double; var speed: Double?; var spec: String }
+        var ops: [Op] = []
+        func clamp(_ spec: String, _ r: (Double, Double)) -> (Double, Double)? {
+            let a = max(clip.trimStart, r.0), b = min(clip.trimEnd, r.1)
+            if b - a < 0.01 {
+                FileHandle.standardError.write(Data("warning: \(spec) is outside clip \(n + 1)'s trim; ignored\n".utf8))
+                return nil
+            }
+            return (a, b)
+        }
+        for spec in o.cuts {
+            let (idx, v) = Parse.indexed(spec)
+            guard idx == nil || idx == n + 1 else { continue }
+            do {
+                if let r = clamp("--cut \(spec)", try Parse.sourceRange(v, markers: markers)) { ops.append(Op(a: r.0, b: r.1, speed: nil, spec: "--cut \(spec)")) }
+            } catch { throw ReelError.message("--cut \(spec): \(error.localizedDescription)") }
+        }
+        for spec in o.speeds {
+            let (idx, v) = Parse.indexed(spec)
+            guard idx == nil || idx == n + 1, v.contains(".."), let eq = v.lastIndex(of: "=") else { continue }
+            guard let x = Double(v[v.index(after: eq)...]), x > 0 else { throw ReelError.message("--speed \(spec): expected A..B=FACTOR") }
+            do {
+                if let r = clamp("--speed \(spec)", try Parse.sourceRange(String(v[..<eq]), markers: markers)) {
+                    ops.append(Op(a: r.0, b: r.1, speed: x, spec: "--speed \(spec)"))
+                }
+            } catch { throw ReelError.message("--speed \(spec): \(error.localizedDescription)") }
+        }
+        guard !ops.isEmpty else { return [(clip, .init(kind: .cut, duration: 0))] }
+        ops.sort { $0.a < $1.a }
+        for (x, y) in zip(ops, ops.dropFirst()) where y.a < x.b - 1e-6 {
+            throw ReelError.message(String(format: "%@ and %@ overlap (%.2f–%.2f and %.2f–%.2f)", x.spec, y.spec, x.a, x.b, y.a, y.b))
+        }
+        let fade = EditPlan.Transition(kind: o.cutFade > 0 ? .crossfade : .cut, duration: max(0, o.cutFade))
+        let hard = EditPlan.Transition(kind: .cut, duration: 0)
+        var out: [(EditPlan.Clip, EditPlan.Transition)] = []
+        var cur = clip.trimStart
+        var pendingJoin = hard
+        func piece(_ a: Double, _ b: Double, speed: Double) {
+            guard b - a > 0.02 else { return }
+            var c = clip
+            c.trimStart = a; c.trimEnd = b; c.speed = speed
+            out.append((c, out.isEmpty ? hard : pendingJoin))
+            pendingJoin = hard
+        }
+        for op in ops {
+            piece(cur, op.a, speed: clip.speed)
+            if let x = op.speed { piece(op.a, op.b, speed: clip.speed * x) }
+            else if !out.isEmpty { pendingJoin = fade }   // a cut at the very start is just a later trim
+            cur = op.b
+        }
+        piece(cur, clip.trimEnd, speed: clip.speed)
+        guard !out.isEmpty else { throw ReelError.message("Clip \(n + 1): the cuts leave nothing") }
+        return out
+    }
+
     /// Places a zoom on the output timeline/frame.
     static func resolve(_ z: Parse.ZoomSpec, plan: EditPlan, composer: Composer) throws -> EditPlan.Zoom {
         let raw = "\(z.start)…\(z.end)"
         var a: Double, b: Double
-        var clip = (z.clip ?? 1) - 1
-        guard plan.clips.indices.contains(clip) else { throw ReelError.message("--zoom \(raw): there is no clip \(clip + 1)") }
+        var clip = (z.clip ?? 1) - 1   // input clip
+        guard clip >= 0, clip < plan.inputCount else { throw ReelError.message("--zoom \(raw): there is no clip \(clip + 1)") }
         if z.source {
             // Marker names: use the given clip, else the first clip that has them.
             func times(_ i: Int) throws -> (Double, Double) {
-                let ev = try plan.clips[i].loadEvents()
+                let ev = try plan.clips[plan.firstClip(ofInput: i)!].loadEvents()
                 let m = ev?.markers ?? []
                 return (try TimeRef.resolve(z.start, markers: m), try TimeRef.resolve(z.end, markers: m))
             }
             var resolved: (Double, Double)?
             var lastError: Error?
-            for i in (z.clip != nil ? [clip] : Array(plan.clips.indices)) {
+            for i in (z.clip != nil ? [clip] : Array(0..<plan.inputCount)) {
                 do { resolved = try times(i); clip = i; break } catch { lastError = error }
             }
             guard let (sa, sb) = resolved else { throw lastError ?? ReelError.message("--zoom \(raw): cannot resolve times") }
             guard sb > sa else { throw ReelError.message("--zoom \(raw): end must be after start") }
-            let c = plan.clips[clip], start = plan.clipStarts[clip]
-            a = start + (sa - c.trimStart) / c.speed
-            b = start + (sb - c.trimStart) / c.speed
-            let lo = start, hi = start + c.duration
-            if b <= lo || a >= hi {
-                throw ReelError.message(String(format: "--zoom %@ falls outside clip %d's trim (source %.2f–%.2f)", raw, clip + 1, c.trimStart, c.trimEnd))
+            a = plan.outputTime(input: clip, source: sa)
+            b = plan.outputTime(input: clip, source: sb)
+            if b - a < 0.01 {
+                let segs = plan.clips.filter { $0.input == clip }
+                throw ReelError.message(String(format: "--zoom %@ falls outside clip %d's trim or inside a cut (source %.2f–%.2f)",
+                                               raw, clip + 1, segs.first?.trimStart ?? 0, segs.last?.trimEnd ?? 0))
             }
-            a = max(lo, a); b = min(hi, b)
         } else {
             guard let x = Double(z.start), let y = Double(z.end) else { throw ReelError.message("--zoom \(raw): bad times") }
             a = x; b = y
@@ -166,7 +272,7 @@ public enum Planner {
 
         func out(_ x: Double, _ y: Double) -> (Double, Double) {
             guard z.source else { return (x, y) }
-            let p = composer.outputPoint(clip: clip, sourceX: x, sourceY: y)
+            let p = composer.outputPoint(clip: plan.firstClip(ofInput: clip)!, sourceX: x, sourceY: y)
             return (p.x, p.y)
         }
         switch z.target {
@@ -231,12 +337,18 @@ public enum Exporter {
         // One instruction per span with a constant set of visible clips.
         var cuts = Set<Double>([0, plan.totalDuration])
         for (i, c) in plan.clips.enumerated() { cuts.insert(starts[i]); cuts.insert(starts[i] + c.duration) }
-        let times = cuts.sorted()
+        // Instructions must tile the composition exactly; scaled (sped-up) ranges
+        // round, so the last one ends where the composition really ends.
+        let end = comp.duration
+        let times = cuts.sorted().filter { end.seconds - $0 > 1e-3 } + [end.seconds]
         var instructions: [ReelInstruction] = []
+        var prev = CMTime.zero
         for (a, b) in zip(times, times.dropFirst()) where b - a > 1e-4 {
             let mid = (a + b) / 2
-            let layers = plan.activeClips(at: mid).map { (trackID: videoTracks[$0 % 2].trackID, clip: $0) }
-            instructions.append(ReelInstruction(range: CMTimeRange(start: cm(a), end: cm(b)), layers: layers, composer: composer))
+            let layers = plan.activeClips(at: min(mid, plan.totalDuration - 1e-4)).map { (trackID: videoTracks[$0 % 2].trackID, clip: $0) }
+            let stop = b == times.last ? end : cm(b)
+            instructions.append(ReelInstruction(range: CMTimeRange(start: prev, end: stop), layers: layers, composer: composer))
+            prev = stop
         }
 
         let vc = AVMutableVideoComposition()
@@ -260,7 +372,8 @@ public enum Exporter {
             }
         }
         defer { monitor.cancel() }
-        try await session.export(to: output, as: type)
+        do { try await session.export(to: output, as: type) }
+        catch { throw ReelError.message("Export failed: \(ErrorInfo(error).summary)") }
     }
 
     private static func insert(_ track: AVAssetTrack, _ range: CMTimeRange, into dest: AVMutableCompositionTrack,

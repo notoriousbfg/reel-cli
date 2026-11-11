@@ -13,6 +13,7 @@ public final class Composer: @unchecked Sendable {
     /// Per clip: drawn cursor sprite at that clip's output scale, and its clicks.
     let cursorSprites: [CursorSprite?]
     let clipClicks: [[RecordingEvents.Click]]
+    let patchImages: [String: CIImage]
 
     public init(plan: EditPlan) throws {
         self.plan = plan
@@ -49,6 +50,42 @@ public final class Composer: @unchecked Sendable {
             return CursorSprite(pixelsPerPoint: k * style.scale)
         }
         clipClicks = events.map { $0?.clicks ?? [] }
+        var imgs: [String: CIImage] = [:]
+        for p in plan.clips.flatMap(\.patches) where imgs[p.image] == nil {
+            guard let img = CIImage(contentsOf: URL(fileURLWithPath: p.image)) else { throw ReelError.message("Cannot read patch image \(p.image)") }
+            imgs[p.image] = img
+        }
+        patchImages = imgs
+    }
+
+    /// Draws clip `i`'s patches over its source frame (source pixels, before crop),
+    /// so they move with zooms and crops like the footage under them.
+    func patched(clip i: Int, source: CIImage, sourceTime st: Double) -> CIImage {
+        let c = plan.clips[i]
+        var out = source
+        let sh = source.extent.height
+        for p in c.patches where (p.start ?? -.infinity) <= st + 1e-6 && st < (p.end ?? .infinity) {
+            guard let img = patchImages[p.image], img.extent.width > 0, img.extent.height > 0 else { continue }
+            let t = CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY)
+                .concatenating(.init(scaleX: p.width / img.extent.width, y: p.height / img.extent.height))
+                .concatenating(.init(translationX: source.extent.minX + p.x, y: source.extent.minY + sh - p.y - p.height))
+            let placed = img.transformed(by: t)
+            if let f = p.feather, f > 0 {
+                // Fade the inner (right, bottom) edges so tiny colour differences leave no seam.
+                let r = placed.extent
+                let right = CIFilter(name: "CILinearGradient", parameters: [
+                    "inputPoint0": CIVector(x: r.maxX - f, y: 0), "inputColor0": CIColor.white,
+                    "inputPoint1": CIVector(x: r.maxX, y: 0), "inputColor1": CIColor.black])!.outputImage!
+                let bottom = CIFilter(name: "CILinearGradient", parameters: [
+                    "inputPoint0": CIVector(x: 0, y: r.minY + f), "inputColor0": CIColor.white,
+                    "inputPoint1": CIVector(x: 0, y: r.minY), "inputColor1": CIColor.black])!.outputImage!
+                let mask = right.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: bottom]).cropped(to: r)
+                out = placed.applyingFilter("CIBlendWithMask", parameters: [kCIInputBackgroundImageKey: out, kCIInputMaskImageKey: mask])
+            } else {
+                out = placed.composited(over: out)
+            }
+        }
+        return out.cropped(to: source.extent)
     }
 
     // MARK: Coordinate mapping
@@ -148,8 +185,9 @@ public final class Composer: @unchecked Sendable {
     // MARK: Frame composition
 
     /// Content for clip `i` placed on a transparent canvas.
-    func layer(clip i: Int, source: CIImage, at t: Double) -> CIImage {
+    func layer(clip i: Int, source original: CIImage, at t: Double) -> CIImage {
         let c = plan.clips[i]
+        let source = c.patches.isEmpty ? original : patched(clip: i, source: original, sourceTime: plan.sourceTime(clip: i, at: t))
         let sh = source.extent.height
         let cropCI = CGRect(x: c.crop.x, y: sh - c.crop.y - c.crop.height, width: c.crop.width, height: c.crop.height)
         var img = source.cropped(to: cropCI)

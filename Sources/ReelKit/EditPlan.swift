@@ -41,6 +41,11 @@ public struct EditPlan: Codable, Sendable {
         public var cursorScript: String? = nil
         /// Full length of the source media.
         public var sourceDuration: Double? = nil
+        /// Which input clip this is (0-based). Cuts and speed ranges split one input
+        /// into several consecutive clips of the same file.
+        public var input: Int = 0
+        /// Images drawn over the source before crop and zoom (absolute image paths).
+        public var patches: [RecordingEvents.Patch] = []
         /// Duration on the output timeline.
         public var duration: Double { (trimEnd - trimStart) / speed }
 
@@ -122,6 +127,24 @@ public struct EditPlan: Codable, Sendable {
         return clips.indices.filter { t >= starts[$0] - 1e-6 && t < starts[$0] + clips[$0].duration }
     }
 
+    /// Output time of source time `s` in input clip `g` (0-based). Times inside a
+    /// cut map to the start of what follows it; times outside the trim clamp.
+    public func outputTime(input g: Int, source s: Double) -> Double {
+        let idx = clips.indices.filter { clips[$0].input == g }
+        guard let last = idx.last else { return 0 }
+        let starts = clipStarts
+        for i in idx {
+            let c = clips[i]
+            if s < c.trimStart { return starts[i] }
+            if s <= c.trimEnd { return starts[i] + (s - c.trimStart) / c.speed }
+        }
+        return starts[last] + clips[last].duration
+    }
+
+    /// First plan clip of input clip `g`.
+    public func firstClip(ofInput g: Int) -> Int? { clips.firstIndex { $0.input == g } }
+    public var inputCount: Int { (clips.map(\.input).max() ?? -1) + 1 }
+
     /// Source-media time for clip `i` at output time `t`.
     public func sourceTime(clip i: Int, at t: Double) -> Double {
         clips[i].trimStart + max(0, t - clipStarts[i]) * clips[i].speed
@@ -140,6 +163,37 @@ public enum Parse {
               !(s[a].isEmpty && s[b].isEmpty)
         else { return (s, nil, nil) }
         return (String(s[p]), Double(s[a]), Double(s[b]))
+    }
+
+    /// `A..B` source range (seconds or marker references) for --cut and --speed.
+    public static func sourceRange(_ s: String, markers: [RecordingEvents.Marker]) throws -> (Double, Double) {
+        guard let r = s.range(of: "..") else { throw ReelError.message("Expected START..END, got \(s)") }
+        let a = try TimeRef.resolve(String(s[..<r.lowerBound]), markers: markers)
+        let b = try TimeRef.resolve(String(s[r.upperBound...]), markers: markers)
+        guard b > a else { throw ReelError.message(String(format: "%@: end (%.2fs) must be after start (%.2fs)", s, b, a)) }
+        return (a, b)
+    }
+
+    /// `image.png@x,y[,w,h][:START-END]` (source pixels, source seconds).
+    public static func patch(_ s: String) throws -> RecordingEvents.Patch {
+        guard let at = s.lastIndex(of: "@") else { throw ReelError.message("--patch expects IMAGE@x,y[,w,h][:START-END], got \(s)") }
+        let path = String(s[..<at])
+        var rest = String(s[s.index(after: at)...])
+        var start: Double?, end: Double?
+        if let colon = rest.firstIndex(of: ":") {
+            let times = rest[rest.index(after: colon)...]
+            rest = String(rest[..<colon])
+            let parts = times.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, parts[0].isEmpty || Double(parts[0]) != nil, parts[1].isEmpty || Double(parts[1]) != nil
+            else { throw ReelError.message("--patch \(s): times are START-END in source seconds") }
+            start = Double(parts[0]); end = Double(parts[1])
+        }
+        let n = rest.split(separator: ",").map { Double($0.trimmingCharacters(in: .whitespaces)) }
+        guard n.count == 2 || n.count == 4, n.allSatisfy({ $0 != nil }) else {
+            throw ReelError.message("--patch \(s): position is x,y or x,y,w,h in source pixels")
+        }
+        return .init(image: path, x: n[0]!, y: n[1]!, width: n.count == 4 ? n[2]! : -1, height: n.count == 4 ? n[3]! : -1,
+                     start: start, end: end)
     }
 
     /// Optional `N=` prefix used to target a specific clip (1-based) or boundary.

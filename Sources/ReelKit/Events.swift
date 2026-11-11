@@ -22,6 +22,24 @@ public struct RecordingEvents: Codable, Sendable {
     public var synthetic: Bool?
     /// Labelled UI element frames (record --ax-snapshots), at the start and at each marker.
     public var snapshots: [ElementSnapshot]?
+    /// Images to draw over the source (record --clean-titlebar), applied by `reel edit`.
+    public var patches: [Patch]?
+
+    /// An image drawn over a rectangle of the source video, in source pixels
+    /// (top-left origin), for source times start…end (nil = open-ended).
+    public struct Patch: Codable, Sendable, Equatable {
+        public var image: String          // relative to the sidecar's folder, or absolute
+        public var x, y, width, height: Double
+        public var start: Double?
+        public var end: Double?
+        /// Pixels over which the right and bottom edges blend into the footage.
+        public var feather: Double?
+        public init(image: String, x: Double, y: Double, width: Double, height: Double,
+                    start: Double? = nil, end: Double? = nil, feather: Double? = nil) {
+            self.image = image; self.x = x; self.y = y; self.width = width; self.height = height
+            self.start = start; self.end = end; self.feather = feather
+        }
+    }
 
     public init(captureRect: Rect, pointPixelScale: Double, samples: [CursorSample], cursorInVideo: Bool? = nil) {
         self.captureRect = captureRect

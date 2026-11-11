@@ -30,6 +30,7 @@ public struct RecordOptions: Sendable {
     public var stopOn: String?         // stop when this marker arrives (+ tail)
     public var tail: Double = 0        // seconds to keep recording after the stop marker
     public var markerTimeout: Double?  // bound on each marker wait; fails the take
+    public var cleanTitlebar = false   // store a still of the traffic-light corner to patch over the capture pill
     public var openURL: String?        // URL/file to open in the app (e.g. localhost for web devs)
     public var windowTitle: String?    // substring match on window title
     public var windowID: UInt32?
@@ -65,7 +66,9 @@ public struct RecordResult: Codable, Sendable {
     /// The error behind the last stream stop (domain, code, description).
     public var stopError: ErrorInfo?
     /// How many times capture was restarted after macOS stopped the stream.
-    public var restarts: Int?
+    public var restarts: Int = 0
+    /// Seconds of the take with no new frames (sum of `gaps`; a held frame shows).
+    public var lostSeconds: Double = 0
     /// Seconds with no new frames while capture restarted (held frame in the video).
     public var gaps: [[Double]]?
     /// Set when --quit-after asked the app to quit.
@@ -155,6 +158,11 @@ public final class Recorder: @unchecked Sendable {
             try Accessibility.require("--ax-snapshots")
             if opts.display { throw ReelError.message("--ax-snapshots records one window; drop --display") }
         }
+        if opts.cleanTitlebar {
+            if opts.display { throw ReelError.message("--clean-titlebar needs a window recording; drop --display") }
+            if !opts.trackCursor { throw ReelError.message("--clean-titlebar stores its patch in the events sidecar; drop --no-events") }
+        }
+        try FileManager.default.createDirectory(at: opts.output.deletingLastPathComponent(), withIntermediateDirectories: true)
         let (target, targetPID, _) = try await prepareTarget(log: log)
         let signals = StopSignals(exitOf: opts.untilExit ? targetPID : nil)
         defer { signals.cancel() }
@@ -197,6 +205,42 @@ public final class Recorder: @unchecked Sendable {
                 remaining -= 1
             }
         }
+
+        // --clean-titlebar: a still of the traffic-light corner, taken before each
+        // stream starts (stills don't show the "being shared" pill).
+        var titlebars: [RecordingEvents.Patch] = []
+        func titlebarStill(at t: Double?) async {
+            guard opts.cleanTitlebar else { return }
+            let name = "\(base).titlebar\(titlebars.isEmpty ? "" : "-\(titlebars.count + 1)").png"
+            do {
+                let w = min(90, rect.width), h = min(40, rect.height)
+                let c = SCStreamConfiguration()
+                c.sourceRect = CGRect(x: 0, y: 0, width: w, height: h)
+                c.width = Int((w * scale).rounded()); c.height = Int((h * scale).rounded())
+                c.showsCursor = false
+                c.captureResolution = .best
+                var img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
+                if t != nil {
+                    // After a stream stops, macOS fades the traffic lights back in; wait
+                    // (up to 1s) until two stills ~0.12s apart match.
+                    let deadline = Date().addingTimeInterval(1)
+                    while Date() < deadline {
+                        try await Task.sleep(for: .milliseconds(120))
+                        let next = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: c)
+                        let settled = Self.meanDifference(img, next) < 0.004
+                        img = next
+                        if settled { break }
+                    }
+                }
+                try Stills.writeImage(img, to: dir.appendingPathComponent(name))
+                if !titlebars.isEmpty { titlebars[titlebars.count - 1].end = t }
+                titlebars.append(.init(image: name, x: 0, y: 0, width: Double(img.width), height: Double(img.height),
+                                       start: t, feather: (8 * scale).rounded()))
+            } catch {
+                log("warning: --clean-titlebar still failed: \(ErrorInfo(error).summary)")
+            }
+        }
+        await titlebarStill(at: nil)
 
         var current = try CaptureSegment(filter: filter, config: config, url: partURL(0), hevc: opts.hevc)
         try await current.start()
@@ -273,6 +317,7 @@ public final class Recorder: @unchecked Sendable {
                     break
                 }
                 do {
+                    await titlebarStill(at: (gapStart * 1000).rounded() / 1000)
                     let next = try CaptureSegment(filter: filter, config: config, url: partURL(parts.count), hevc: opts.hevc)
                     try await next.start()
                     let offset = CACurrentMediaTime() - t0
@@ -335,6 +380,7 @@ public final class Recorder: @unchecked Sendable {
             events.markers = markers.isEmpty ? nil : markers
             events.shapes = tracker.shapes.isEmpty ? nil : tracker.shapes
             events.snapshots = snapshots.isEmpty ? nil : snapshots
+            events.patches = titlebars.isEmpty ? nil : titlebars
             try events.write(for: opts.output)
             eventsPath = RecordingEvents.sidecarURL(for: opts.output).path
         }
@@ -345,7 +391,8 @@ public final class Recorder: @unchecked Sendable {
                             duration: elapsed, app: opts.app, windowTitle: target.title, pid: targetPID,
                             windowID: target.windowID, markers: markers.isEmpty ? nil : markers,
                             stoppedEarly: endedEarly?.summary, stopError: lastError,
-                            restarts: restarts > 0 ? restarts : nil, gaps: gaps.isEmpty ? nil : gaps, quit: quit,
+                            restarts: restarts, lostSeconds: (gaps.reduce(0) { $0 + $1[1] - $1[0] } * 1000).rounded() / 1000,
+                            gaps: gaps.isEmpty ? nil : gaps, quit: quit,
                             endedBy: endedBy, timedOut: timedOut)
     }
 
@@ -429,6 +476,7 @@ public final class Recorder: @unchecked Sendable {
     // MARK: - Still image (reel shot)
 
     public func shot(_ s: ShotOptions, log: @escaping (String) -> Void) async throws -> ShotResult {
+        try FileManager.default.createDirectory(at: opts.output.deletingLastPathComponent(), withIntermediateDirectories: true)
         let (target, targetPID, launchedNew) = try await prepareTarget(log: log)
         let signals = StopSignals(exitOf: nil)
         defer { signals.cancel() }
@@ -469,6 +517,27 @@ public final class Recorder: @unchecked Sendable {
             if quitAtEnd { _ = await quitIfAsked(targetPID, force: true, log: log) }
             throw error
         }
+    }
+
+    /// Mean absolute RGB difference (0–1) between two same-size images.
+    static func meanDifference(_ a: CGImage, _ b: CGImage) -> Double {
+        let w = min(a.width, b.width, 128), h = min(a.height, b.height, 64)
+        guard w > 0, h > 0 else { return 1 }
+        func pixels(_ img: CGImage) -> [UInt8] {
+            var buf = [UInt8](repeating: 0, count: w * h * 4)
+            buf.withUnsafeMutableBytes { p in
+                let ctx = CGContext(data: p.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                    space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                ctx?.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+            }
+            return buf
+        }
+        let pa = pixels(a), pb = pixels(b)
+        var sum = 0
+        for i in stride(from: 0, to: pa.count, by: 4) {
+            sum += abs(Int(pa[i]) - Int(pb[i])) + abs(Int(pa[i + 1]) - Int(pb[i + 1])) + abs(Int(pa[i + 2]) - Int(pb[i + 2]))
+        }
+        return Double(sum) / Double(w * h * 3 * 255)
     }
 
     static func windowExists(_ id: UInt32?) async -> Bool {

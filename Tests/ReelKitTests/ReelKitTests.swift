@@ -328,3 +328,50 @@ import Testing
         #expect(throws: (any Error).self) { try CursorScript.parse(Data(#"{"nope": 1}"#.utf8)) }
     }
 }
+
+@Suite struct CutSpeedPatchTests {
+    let markers: [RecordingEvents.Marker] = [.init(label: "asked", t: 2), .init(label: "answered", t: 6)]
+    func clip() -> EditPlan.Clip {
+        .init(path: "/x.mov", trimStart: 0, trimEnd: 9, crop: .init(x: 0, y: 0, width: 100, height: 100),
+              sourceWidth: 100, sourceHeight: 100, speed: 1, hasEvents: true)
+    }
+    func plan(_ o: EditOptions) throws -> EditPlan {
+        let pieces = try Planner.split(clip(), n: 0, markers: markers, o)
+        return EditPlan(clips: pieces.map(\.clip), transitions: pieces.dropFirst().map(\.join), zooms: [], zoomEase: 0.6,
+                        canvas: .init(width: 100, height: 100, padding: 0, background: ["#000"], cornerRadius: 0, shadow: false),
+                        fadeIn: 0, fadeOut: 0, fps: 60, mute: true)
+    }
+
+    @Test func rangesAndPatches() throws {
+        #expect(try Parse.sourceRange("asked+1.0..answered-0.3", markers: markers) == (3.0, 5.7))
+        #expect(try Parse.sourceRange("1.5..4", markers: []) == (1.5, 4))
+        #expect(throws: (any Error).self) { try Parse.sourceRange("4..1", markers: []) }
+        #expect(throws: (any Error).self) { try Parse.sourceRange("nope..4", markers: markers) }
+        let p = try Parse.patch("/a/b@c.png@10,20,30,40:1.5-")
+        #expect(p.image == "/a/b@c.png" && p.x == 10 && p.height == 40 && p.start == 1.5 && p.end == nil)
+        #expect(try Parse.patch("i.png@5,6").width == -1)
+        #expect(throws: (any Error).self) { try Parse.patch("i.png@5") }
+    }
+
+    @Test func cutKeepsSourceTime() throws {
+        var o = EditOptions(); o.cuts = ["asked+1.0..answered-0.3"]
+        let p = try plan(o)
+        #expect(p.clips.map(\.trimStart) == [0, 5.7] && p.transitions.first?.kind == .crossfade)
+        #expect(abs(p.totalDuration - (9 - 2.7 - 0.3)) < 1e-9)
+        #expect(abs(p.outputTime(input: 0, source: 6.0) - 3.0) < 1e-9)       // after the cut
+        #expect(abs(p.outputTime(input: 0, source: 4.0) - 2.7) < 1e-9)       // inside it → join
+        #expect(abs(p.sourceTime(clip: 1, at: 3.0) - 6.0) < 1e-9)
+    }
+
+    @Test func speedRange() throws {
+        var o = EditOptions(); o.speeds = ["asked+1.0..answered-0.3=6"]
+        let p = try plan(o)
+        #expect(p.clips.map(\.speed) == [1, 6, 1])
+        #expect(abs(p.outputTime(input: 0, source: 5.7) - 3.45) < 1e-9)
+        #expect(abs(p.sourceTime(clip: 1, at: 3.2) - 4.2) < 1e-9)
+        var bad = EditOptions(); bad.cuts = ["2..4"]; bad.speeds = ["3..5=2"]
+        #expect(throws: (any Error).self) { try plan(bad) }                 // overlap
+        var start = EditOptions(); start.cuts = ["0..1"]
+        #expect(try plan(start).clips.count == 1)                           // a cut at the start is a trim
+    }
+}

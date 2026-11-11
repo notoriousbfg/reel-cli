@@ -42,7 +42,7 @@ struct Reel: AsyncParsableCommand {
             `locate`, `act` and `record --ax-snapshots` also need Accessibility.
             File formats (events sidecar, cursor scripts, presets, scenes): reel help formats
             """,
-        version: "0.3.0",
+        version: "0.4.0",
         subcommands: [Record.self, Shot.self, Stop.self, Mark.self, Windows.self, Edit.self, Run.self, Cursor.self,
                       Changes.self, Info.self, Frame.self, Sheet.self, Locate.self, Act.self, Doctor.self, Formats.self]
     )
@@ -91,6 +91,8 @@ struct Record: AsyncParsableCommand {
     var noCursorShapes = false
     @Option(help: "Restart capture up to this many times if macOS stops the stream.")
     var maxRestarts = 5
+    @Flag(help: "Hide macOS's purple \"being shared\" pill over the window's traffic lights: store a still of that corner, which `reel edit` draws over it.")
+    var cleanTitlebar = false
     @Option(help: "Seconds to count down before recording.")
     var countdown: Double = 0
     @Option(help: "Frames per second.")
@@ -108,7 +110,7 @@ struct Record: AsyncParsableCommand {
         var o = try target.options(output: absURL(output))
         o.untilExit = untilExit; o.axSnapshots = axSnapshots
         o.cursorShapes = !noCursorShapes; o.maxRestarts = max(0, maxRestarts)
-        o.stopOn = stopOn; o.tail = max(0, tail)
+        o.stopOn = stopOn; o.tail = max(0, tail); o.cleanTitlebar = cleanTitlebar
         o.duration = duration; o.countdown = countdown; o.fps = fps
         o.showsCursor = !noCursor; o.trackCursor = !noEvents; o.hevc = !h264
         if untilExit && target.pid == nil && target.app == nil && target.windowID == nil && target.windowTitle == nil {
@@ -346,7 +348,14 @@ struct Edit: AsyncParsableCommand {
             which means source-clip seconds and 0–1 of the source frame (no arithmetic
             after re-trimming). Marker names (from `reel mark`) are source times.
             --crop is in SOURCE pixels. Prefix N= to target clip N (crop, speed, events,
-            cursor-script, zoom) or the Nth join (transition).
+            cursor-script, zoom, cut, patch) or the Nth join (transition).
+
+            Dead time, by source time or marker:
+              --cut asked+1.0..answered-0.3          remove it (0.3s crossfade, --cut-fade)
+              --speed asked+1.0..answered-0.3=6      play it 6× faster
+            Markers, cursor, clicks and src: zooms after a cut still land on the right frames.
+            --patch logo.png@0,0,180,80[:0-12]     draw over source pixels (before crop/zoom);
+            patches stored by `record --clean-titlebar` apply automatically.
 
             Zoom forms:
               3-7:2@0.25,0.4                 output time, point
@@ -378,8 +387,16 @@ struct Edit: AsyncParsableCommand {
     var zoomEase: Double?
     @Option(parsing: .singleValue, help: "cut|crossfade|fade|slide-left|slide-right|slide-up|slide-down|wipe|zoom[:SECONDS]. Repeatable; N= for one join.")
     var transition: [String] = []
-    @Option(parsing: .singleValue, help: "Playback speed, e.g. 2 or 2=1.5. Repeatable.")
+    @Option(parsing: .singleValue, help: "Playback speed: 2, 2=1.5 (clip 2), or a source stretch A..B=6 (seconds or markers, e.g. asked+1..answered-0.3=6). Repeatable.")
     var speed: [String] = []
+    @Option(parsing: .singleValue, help: "Remove a source stretch A..B (seconds or markers, e.g. asked+1.0..answered-0.3), with a short crossfade across the join. Repeatable; N= for one clip.")
+    var cut: [String] = []
+    @Option(help: "Crossfade seconds across each --cut (0 = hard cut; default 0.3).")
+    var cutFade: Double?
+    @Option(parsing: .singleValue, help: "Draw IMAGE over a source rectangle: IMAGE@x,y[,w,h][:START-END] (source px and seconds), before crop and zoom. Repeatable; N= for one clip.")
+    var patch: [String] = []
+    @Flag(help: "Ignore patches stored by `record --clean-titlebar`.")
+    var noRecordedPatches = false
     @Option(help: "Output size WxH (default: cropped size of first clip + padding).")
     var size: String?
     @Option(help: "Pixels of background around the content.")
@@ -434,6 +451,7 @@ struct Edit: AsyncParsableCommand {
         o.zooms = zoom; o.autoZoom = autoZoom; o.zoomEase = zoomEase ?? p.zoomEase ?? 0.6
         o.transitions = transition.isEmpty ? (p.transition.map { [$0] } ?? []) : transition
         o.speeds = speed; o.size = size ?? p.size
+        o.cuts = cut; o.cutFade = cutFade ?? 0.3; o.patches = patch; o.recordedPatches = !noRecordedPatches
         o.padding = padding ?? p.padding ?? 0
         o.background = background ?? p.background ?? "#000000"
         o.cornerRadius = cornerRadius ?? p.cornerRadius ?? 0
@@ -454,6 +472,7 @@ struct Edit: AsyncParsableCommand {
             log("Note: the recording already shows the system cursor, so there will be two. Record with --no-cursor when using --cursor.")
         }
         let out = absURL(output)
+        try FileManager.default.createDirectory(at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
         if dryRun {
             struct DryRun: Encodable { var duration: Double; var clipStarts: [Double]; var plan: EditPlan }
             try printJSON(DryRun(duration: plan.totalDuration, clipStarts: plan.clipStarts, plan: plan))
@@ -900,6 +919,10 @@ struct Formats: ParsableCommand {
             "snapshots": [{"t": 4.1, "marker": "open-palette", "elements": [
                 {"role": "AXButton", "label": "Highlight", "frame": {…}, "center": [x, y], …}]}],
                 // record --ax-snapshots: at t=0 and each marker; frames are 0–1 of the window
+            "patches": [{"image": "raw.titlebar.png", "x": 0, "y": 0, "width": 180, "height": 80,
+                         "start": 2.01, "end": null, "feather": 16}],
+                // record --clean-titlebar: drawn over the source (px) by `reel edit`, before crop
+                // and zoom; one per capture segment; --no-recorded-patches to skip
             "startedAt": 1762859000.12,                 // Unix time of t=0
             "cursorInVideo": false,                     // was the system cursor captured?
             "synthetic": true                           // generated from a cursor script
@@ -944,7 +967,8 @@ struct Formats: ParsableCommand {
            "record": {<reel record flags, camelCase>,
                       "startOn": "ready", "stopOn": "done", "tail": 1.5, "timeout": 60},
            "cursorScript": "moves.json" | [steps…],
-           "edit": {"trim": "1.2-22" | [1.2, 22], "input": "raw.mov", <reel edit flags>},
+           "edit": {"trim": "1.2-22" | [1.2, 22], "input": "raw.mov", <reel edit flags>,
+                    "cut": ["asked+1..answered-0.3"], "speed": ["a..b=6"], "patch": ["img.png@0,0"]},
            "teardown": ["shell command", …]}     // always runs, after quitAfter
           or, for a still: {"prepare": …, "shot": {<reel shot flags>}, "teardown": …}
           Commands run with sh in the scene's folder. stdout lines KEY=VALUE from prepare
