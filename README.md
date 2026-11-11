@@ -150,7 +150,7 @@ keystroke, both named by markers rather than seconds.
 
 ### A still
 
-![A document beside its attached PDF, with a passage selected](docs/examples/research-documents.jpg)
+![A document beside its attached PDF, with a passage selected](docs/examples/research-documents.webp)
 
 A `shot` scene launches the app, waits for a `ready` marker, lets the window settle
 and saves one picture.
