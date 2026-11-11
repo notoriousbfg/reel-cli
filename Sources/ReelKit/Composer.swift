@@ -58,6 +58,25 @@ public final class Composer: @unchecked Sendable {
         patchImages = imgs
     }
 
+    /// `still` darkened by as much as `frame` is darker than it in the strip at the
+    /// still's right edge, which the capture pill never covers. A still taken before a
+    /// sheet or modal dimmed the window then dims with it. Never brightens.
+    static func toneMatched(_ still: CIImage, to frame: CIImage) -> CIImage {
+        let r = still.extent
+        let strip = CGRect(x: r.maxX - r.width * 0.15, y: r.minY, width: r.width * 0.15, height: r.height * 0.85)
+        func average(_ image: CIImage) -> CIImage {
+            image.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: strip)]).clampedToExtent()
+        }
+        // CIDivideBlendMode: background ÷ input, per channel.
+        let gain = average(still)
+            .applyingFilter("CIDivideBlendMode", parameters: [kCIInputBackgroundImageKey: average(frame)])
+            .applyingFilter("CIColorClamp", parameters: ["inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 1),
+                                                         "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)])
+        return still.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: gain])
+            .applyingFilter("CIBlendWithAlphaMask", parameters: [kCIInputBackgroundImageKey: CIImage.empty(), kCIInputMaskImageKey: still])
+            .cropped(to: r)
+    }
+
     /// Draws clip `i`'s patches over its source frame (source pixels, before crop),
     /// so they move with zooms and crops like the footage under them.
     func patched(clip i: Int, source: CIImage, sourceTime st: Double) -> CIImage {
@@ -69,7 +88,8 @@ public final class Composer: @unchecked Sendable {
             let t = CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY)
                 .concatenating(.init(scaleX: p.width / img.extent.width, y: p.height / img.extent.height))
                 .concatenating(.init(translationX: source.extent.minX + p.x, y: source.extent.minY + sh - p.y - p.height))
-            let placed = img.transformed(by: t)
+            var placed = img.transformed(by: t)
+            if p.matchTone == true { placed = Self.toneMatched(placed, to: out) }
             if let f = p.feather, f > 0 {
                 // Fade the inner (right, bottom) edges so tiny colour differences leave no seam.
                 let r = placed.extent

@@ -260,7 +260,7 @@ public final class Recorder: @unchecked Sendable {
                 // Where the window's corner sits in the video (0,0 for window captures).
                 let ox = ((win.frame.minX - rect.minX) * scale).rounded(), oy = ((win.frame.minY - rect.minY) * scale).rounded()
                 titlebars.append(.init(image: name, x: ox, y: oy, width: Double(img.width), height: Double(img.height),
-                                       start: t, feather: (8 * scale).rounded()))
+                                       start: t, feather: (8 * scale).rounded(), matchTone: true))
             } catch {
                 log("warning: --clean-titlebar still failed: \(ErrorInfo(error).summary)")
             }

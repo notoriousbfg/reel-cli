@@ -178,6 +178,7 @@ public enum Planner {
                         FileHandle.standardError.write(Data("warning: recorded patch \(p.image) is missing; skipped\n".utf8))
                         continue
                     }
+                    p.matchTone = p.matchTone ?? true   // sidecars written before the field existed
                     out.append(p)
                 }
             }

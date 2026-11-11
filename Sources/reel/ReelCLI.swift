@@ -42,7 +42,7 @@ struct Reel: AsyncParsableCommand {
             `locate`, `act` and `record --ax-snapshots` also need Accessibility.
             File formats (events sidecar, cursor scripts, presets, scenes): reel help formats
             """,
-        version: "0.5.3",
+        version: "0.5.4",
         subcommands: [Record.self, Shot.self, Stop.self, Mark.self, Windows.self, Edit.self, Run.self, Cursor.self,
                       Changes.self, Info.self, Frame.self, Sheet.self, Locate.self, Act.self, Doctor.self, Formats.self]
     )
@@ -1047,9 +1047,10 @@ struct Formats: ParsableCommand {
                 {"role": "AXButton", "label": "Highlight", "frame": {…}, "center": [x, y], …}]}],
                 // record --ax-snapshots: at t=0 and each marker; frames are 0–1 of the window
             "patches": [{"image": "raw.titlebar.png", "x": 0, "y": 0, "width": 180, "height": 80,
-                         "start": 2.01, "end": null, "feather": 16}],
+                         "start": 2.01, "end": null, "feather": 16, "matchTone": true}],
                 // record --clean-titlebar: drawn over the source (px) by `reel edit`, before crop
-                // and zoom; one per capture segment; --no-recorded-patches to skip
+                // and zoom; one per capture segment; --no-recorded-patches to skip. matchTone
+                // (default true here) darkens the still when a sheet or modal dims the window
             "startedAt": 1762859000.12,                 // Unix time of t=0
             "cursorInVideo": false,                     // was the system cursor captured?
             "synthetic": true                           // generated from a cursor script
